@@ -1,0 +1,9 @@
+name: "Distributed Data Cluster Triage"
+version: "1.0.0"
+description: "An environment where an agent acts as a DevOps engineer to stabilize a failing distributed data cluster."
+tasks:
+  - easy
+  - medium
+  - hard
+  - very_hard
+  - nightmare
