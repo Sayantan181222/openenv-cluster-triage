@@ -13,7 +13,7 @@ license: mit
 ## Environment Description & Motivation
 Managing a distributed data processing cluster (e.g., Hadoop/HDFS) is a complex, high-stakes DevOps challenge. When compute resources are finite, runaway jobs and hardware constraints can cause cascading failures that require immediate, multi-step human intervention.
 
-This OpenEnv simulates an enterprise-level 4-node cluster under stress. It is not a toy; it is a genuine infrastructure triage scenario. An AI agent acting as an automated Site Reliability Engineer (SRE) must observe the cluster's health dashboard, identify root causes of failures, and issue precise terminal commands to prevent total system collapse.
+This OpenEnv simulates an enterprise-level 4-node cluster under stress. It is a genuine infrastructure triage scenario. An AI agent acting as an automated Site Reliability Engineer (SRE) must observe the cluster's health dashboard, identify root causes of failures, and issue precise terminal commands to prevent total system collapse.
 
 ## Observation & Action Spaces
 The environment strictly adheres to the OpenEnv Pydantic specifications.
@@ -58,6 +58,17 @@ This environment is containerized for seamless execution and automated validatio
 1. Install dependencies: `pip install -r requirements.txt`
 2. Configure your `.env` file with your `HF_TOKEN`, `MODEL_NAME`, and `API_BASE_URL`.
 3. Execute the baseline test: `python inference.py`
+
+### How to Use the Web Dashboard (Hugging Face)
+
+The OpenEnv Web UI is designed to be fully interactive and provides a real-time window into the SRE Agent's decision-making process. Here is how to evaluate the simulation:
+
+1. **Access the Dashboard:** Navigate to the public Hugging Face Space URL.
+2. **Select a Threat Level:** Use the radio buttons on the left control panel to choose a scenario, ranging from `Easy` (a single stuck job) to `Nightmare` (a multi-vector Hydra attack).
+   * *Note:* Selecting a level instantly updates the **Task Briefing** box to explain the specific failure state and the required win conditions.
+3. **Deploy the Agent:** Click the blue **▶ Execute Protocol** button. 
+   * *API Notice:* To conserve compute, the environment is strictly event-driven. It only makes LLM API calls when this button is clicked. 
+4. **Observe the Triage:** Watch the dark-mode **Agent Terminal Logs** on the right. The UI will stream the AI's step-by-step actions, rewards, and system feedback in real-time as it attempts to stabilize the cluster and achieve a `SYSTEM NOMINAL` status.
 
 ## Baseline Scores
 The baseline inference script utilizes `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` via the Hugging Face Serverless API. It successfully navigates the complex logic gates of all 5 tiers without hallucination.
