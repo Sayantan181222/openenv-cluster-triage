@@ -11,6 +11,7 @@ pydantic==2.10.4
 
 # OpenAI client (for inference.py LLM calls)
 openai==1.58.1
+openenv-core<=0.2.0
 
 # Environment variable loading
 python-dotenv==1.0.1
