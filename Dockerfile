@@ -1,20 +1,35 @@
-# Use a highly specific, updated tag rather than just 'slim'
+# ── OpenEnv: Distributed Data Cluster Triage ──────────────────────────────
+# Serves:
+#   • OpenEnv HTTP API:  POST /reset, POST /step, GET /state, GET /health
+#   • Gradio Web UI:     GET  /  (interactive demonstration)
+# Port: 7860 (required for Hugging Face Spaces)
+# ──────────────────────────────────────────────────────────────────────────
+
 FROM python:3.10.14-slim-bookworm
 
 WORKDIR /app
 
-# THE FIX: Force Debian to install the latest security patches
-RUN apt-get update && apt-get upgrade -y && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# Apply latest security patches
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install your Python requirements
+# Install Python dependencies first (Docker cache layer)
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-# Copy your environment and agent code
+# Copy environment source
 COPY . .
 
-# Run the baseline agent
-CMD ["python", "-u", "inference.py"]
+# Health check — confirms the FastAPI server is live
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:7860/health || exit 1
+
+# Expose Hugging Face Spaces port
+EXPOSE 7860
+
+# Run the combined FastAPI + Gradio server
+# app:app refers to the `app` variable in app.py (the gr.mount_gradio_app result)
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1"]

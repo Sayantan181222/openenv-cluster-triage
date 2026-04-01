@@ -8,14 +8,26 @@ pinned: false
 license: mit
 ---
 
-# OpenEnv: Distributed Data Cluster Triage (Enterprise 4-Node)
+# 🚀 OpenEnv: Distributed Data Cluster Triage (Enterprise 4-Node)
 
-## Environment Description & Motivation
+## 📖 Overview & Motivation
 Managing a distributed data processing cluster (e.g., Hadoop/HDFS) is a complex, high-stakes DevOps challenge. When compute resources are finite, runaway jobs and hardware constraints can cause cascading failures that require immediate, multi-step human intervention.
 
-This OpenEnv simulates an enterprise-level 4-node cluster under stress. It is a genuine infrastructure triage scenario. An AI agent acting as an automated Site Reliability Engineer (SRE) must observe the cluster's health dashboard, identify root causes of failures, and issue precise terminal commands to prevent total system collapse.
+This OpenEnv simulates an enterprise-level 4-node cluster under stress. It is a genuine infrastructure triage scenario. An AI agent acting as an automated Site Reliability Engineer (SRE) must observe the cluster's telemetry dashboard, identify root causes of failures, and issue precise terminal commands to prevent total system collapse.
 
-## Observation & Action Spaces
+---
+
+## ⚙️ Architecture: How It Works
+This environment is built as a complete, containerized Reinforcement Learning (RL) ecosystem:
+
+1. **The Simulation Engine (`environment.py`):** An OpenEnv-compliant state machine that tracks node health, RAM/Disk usage, active jobs, and enforces strict logic gates (e.g., you cannot restart a node if its disk is full; you must kill Hydra malware before clearing storage).
+2. **The Backend API (`FastAPI`):** Exposes standard programmatic RL endpoints (`/reset`, `/step`, `/state`, `/health`) allowing external scripts and evaluators to interact with the environment headlessly.
+3. **The Web Dashboard (`Gradio`):** Mounted directly on top of the FastAPI server, this provides a dark-mode, 3-column "SRE Command Center" for humans to interactively step through the simulation and watch the LLM make decisions in real-time.
+4. **The Agent (`inference.py` / `OpenAI Client`):** Uses the `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` model via the Hugging Face Serverless API to analyze the observation JSON and output strict, precise JSON action commands.
+
+---
+
+## 🧠 Observation & Action Spaces
 The environment strictly adheres to the OpenEnv Pydantic specifications.
 
 ### Observation Space
@@ -30,51 +42,71 @@ The agent interacts with the environment by outputting a strictly typed `Cluster
 * **`action_type`**: The command to execute (`kill_job`, `restart_node`, `clear_temp_storage`, `noop`).
 * **`target_id`**: The specific `job_id` or `node_id` to apply the action to.
 
-## Task Descriptions & Difficulty
+---
 
+## 🎯 Task Descriptions & Difficulty
 The environment features a 5-tier difficulty scale. It provides a meaningful, continuous reward signal, penalizing destructive actions and rewarding partial progress.
 
-* **EASY (The Stuck Job):** A rogue MapReduce job is stuck in an infinite loop. 
+* **🟢 EASY (The Stuck Job):** A rogue MapReduce job is stuck in an infinite loop. 
   * *Expected Action:* `kill_job` -> `job_rogue_99`. 
-* **MEDIUM (The Full Disk):** A worker node's disk has hit 99.9% capacity.
+* **🟡 MEDIUM (The Full Disk):** A worker node's disk has hit 99.9% capacity.
   * *Expected Sequence:* `clear_temp_storage` -> `restart_node`. 
-* **HARD (The Cascade Failure):** A rogue job caused a replication storm, crashing Nodes 1 and 2. Failover traffic is overloading Nodes 3 and 4.
+* **🟠 HARD (The Cascade Failure):** A rogue job caused a replication storm, crashing Nodes 1 and 2. Failover traffic is overloading Nodes 3 and 4.
   * *Expected Sequence:* Kill the root job, clear storage on dead nodes, then safely reboot them. (5 steps)
-* **VERY HARD (Multi-Vector Attack):** A disk-filling log spammer and a RAM-hogging crypto miner hit the cluster simultaneously.
+* **🔴 VERY HARD (Multi-Vector Attack):** A disk-filling log spammer and a RAM-hogging crypto miner hit the cluster simultaneously.
   * *Expected Sequence:* Isolate and kill both malware jobs before clearing storage and rebooting. (6 steps)
-* **NIGHTMARE (The Hydra Protocol):** Total cluster collapse. Three self-replicating malware jobs are writing garbage data to all 4 nodes. 
+* **☠️ NIGHTMARE (The Hydra Protocol):** Total cluster collapse. Three self-replicating malware jobs are writing garbage data to all 4 nodes. 
   * *Expected Sequence:* The agent must kill ALL THREE Hydra jobs before attempting to clear any storage, otherwise, the surviving malware instantly cross-infects and refills the disks. (11 steps)
 
-## Setup & Usage Instructions
+---
 
-### Running via Docker (Recommended)
-This environment is containerized for seamless execution and automated validation.
-1. Build the image:
-   `docker build -t cluster-triage-env .`
-2. Run the baseline inference script:
-   `docker run -e API_BASE_URL="https://router.huggingface.co/v1" -e MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Llama-70B" -e HF_TOKEN="your_token" cluster-triage-env`
+## 💻 Setup & Usage Instructions
 
-### Running Locally
-1. Install dependencies: `pip install -r requirements.txt`
-2. Configure your `.env` file with your `HF_TOKEN`, `MODEL_NAME`, and `API_BASE_URL`.
-3. Execute the baseline test: `python inference.py`
+You can run this project in three different ways depending on your needs.
 
-### How to Use the Web Dashboard (Hugging Face)
+### Method 1: Hugging Face Spaces (Interactive Web UI)
+The easiest way to evaluate the environment is via the public Hugging Face Space. The UI acts as a step-by-step RL debugger.
 
-The OpenEnv Web UI is designed to be fully interactive and provides a real-time window into the SRE Agent's decision-making process. Here is how to evaluate the simulation:
+1. **Access the Dashboard:** Open the Hugging Face Space URL.
+2. **Select Threat Level:** Use the radio buttons on the left to choose a scenario. The *Active Incident Briefing* will update with your mission constraints.
+3. **Initialize the Environment:** Click the **🔄 Reset** button. This boots up the simulation and populates the *Live Node Status* telemetry grid.
+4. **Deploy the Agent:** Click the purple **▶ AGENT STEP** button. The LLM will evaluate the state and make exactly *one* move. 
+5. **Observe the Triage:** Look at the right-side panel. You will see the agent's command in the Terminal, the resulting Step Reward (+/-), and the dynamic Reward History bar graph update.
+6. **Iterate:** Continue clicking **▶ AGENT STEP** until the terminal declares `SYSTEM NOMINAL`.
 
-1. **Access the Dashboard:** Navigate to the public Hugging Face Space URL.
-2. **Select a Threat Level:** Use the radio buttons on the left control panel to choose a scenario, ranging from `Easy` (a single stuck job) to `Nightmare` (a multi-vector Hydra attack).
-   * *Note:* Selecting a level instantly updates the **Task Briefing** box to explain the specific failure state and the required win conditions.
-3. **Deploy the Agent:** Click the blue **▶ Execute Protocol** button. 
-   * *API Notice:* To conserve compute, the environment is strictly event-driven. It only makes LLM API calls when this button is clicked. 
-4. **Observe the Triage:** Watch the dark-mode **Agent Terminal Logs** on the right. The UI will stream the AI's step-by-step actions, rewards, and system feedback in real-time as it attempts to stabilize the cluster and achieve a `SYSTEM NOMINAL` status.
+### Method 2: Local Docker (Production Simulation)
+Run the exact containerized environment that Hugging Face uses, locally on your machine.
 
-## Baseline Scores
-The baseline inference script utilizes `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` via the Hugging Face Serverless API. It successfully navigates the complex logic gates of all 5 tiers without hallucination.
+1. Create a `.env` file in the root directory and add your API credentials:
+   ```env
+   HF_TOKEN="your_huggingface_token"
+   MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
+   API_BASE_URL="[https://router.huggingface.co/v1](https://router.huggingface.co/v1)"
+   ```
+2. Build the Docker image:
+   ```bash
+   docker build -t cluster-triage-env .
+   ```
+3. Run the container (Ensure you map Port 7860 to access the UI):
+   ```bash
+   docker run -p 7860:7860 --env-file .env cluster-triage-env
+   ```
+4. Open your web browser and navigate to: **`http://localhost:7860`**
 
-* **Easy Task:** 1.0 (Completed in 1 step)
-* **Medium Task:** 1.0 (Completed in 2 steps)
-* **Hard Task:** 1.0 (Completed in 5 steps)
-* **Very Hard Task:** 1.0 (Completed in 6 steps)
-* **Nightmare Task:** 1.0 (Completed in 11 steps)
+### Method 3: Local Python (For Developers)
+If you want to modify the source code, debug, or run the headless terminal script without building a container.
+
+1. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Ensure your `.env` file is configured in the root directory (same as Docker step 1).
+3. **To run the Interactive Web Dashboard & API:**
+   ```bash
+   python app.py
+   ```
+   *(Access the UI via `http://127.0.0.1:7860` in your browser).*
+4. **To run the Automated Terminal Baseline:**
+   ```bash
+   python inference.py
+   ```

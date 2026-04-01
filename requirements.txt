@@ -1,6 +1,19 @@
-pydantic==2.6.3
-openai==1.14.0
-httpx==0.27.2
+# Core web framework (serves both the OpenEnv API and Gradio UI)
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# Gradio UI
+gradio==5.9.1
+requests>=2.31.0
+
+# Pydantic (models, validation)
+pydantic==2.10.4
+
+# OpenAI client (for inference.py LLM calls)
+openai==1.58.1
+
+# Environment variable loading
 python-dotenv==1.0.1
-openenv
-gradio
+
+# HTTP support for health checks in Docker
+httpx==0.28.1

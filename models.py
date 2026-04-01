@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Any
 
 # --- OBSERVATION SPACE ---
 class NodeStatus(BaseModel):
@@ -25,8 +25,19 @@ class ClusterAction(BaseModel):
     action_type: Literal["kill_job", "restart_node", "clear_temp_storage", "noop"]
     target_id: Optional[str] = Field(None, description="The job_id or node_id to target")
 
-# --- REWARD SPACE ---
-class StepReward(BaseModel):
-    score: float = Field(..., description="Reward between 0.0 and 1.0")
-    is_done: bool
-    message: str
+# --- STEP RESULT (OpenEnv spec compliant) ---
+# step() returns a StepResult with .observation, .reward, .done, .info
+# This matches the inference.py contract:
+#   result = env.step(action)
+#   observation = result.observation
+#   reward = result.reward
+#   done = result.done
+class StepResult(BaseModel):
+    observation: ClusterObservation
+    reward: float = Field(..., description="Step reward signal between -1.0 and 1.0")
+    done: bool = Field(..., description="Whether the episode has ended")
+    info: Dict[str, Any] = Field(default_factory=dict, description="Extra info including message")
+
+# --- RESET REQUEST (for HTTP API) ---
+class ResetRequest(BaseModel):
+    task: str = Field("easy", description="Task ID: easy, medium, hard, very_hard, nightmare")
