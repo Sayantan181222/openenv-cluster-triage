@@ -15,7 +15,6 @@ from typing import List, Optional
 from openai import OpenAI
 from dotenv import load_dotenv
 
-
 from environment import ClusterTriageEnv
 from models import ClusterAction
 
@@ -29,14 +28,6 @@ MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 BENCHMARK = "cluster-triage"
 MAX_STEPS = 15
 SUCCESS_SCORE_THRESHOLD = 0.5
-
-MAX_REWARD = {
-    "easy":      1.0,
-    "medium":    1.0,
-    "hard":      1.0,
-    "very_hard": 1.0,
-    "nightmare": 1.0,
-}
 
 if not API_KEY:
     raise EnvironmentError("CRITICAL: HF_TOKEN or API_KEY environment variable is required.")
@@ -87,7 +78,7 @@ def run_task(env: ClusterTriageEnv, task_id: str) -> float:
 
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
+    score = 0.01  # Safe default strictly > 0
     success = False
 
     try:
@@ -133,7 +124,7 @@ EXAMPLE:
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=0.1,
-                    max_tokens=400  # ADDED: crucial for DeepSeek to finish thinking!
+                    max_tokens=400
                 )
                 response_text = completion.choices[0].message.content or ""
             except Exception as e:
@@ -144,8 +135,6 @@ EXAMPLE:
                 break
 
             action = parse_model_action(response_text)
-            
-            # Compress action for standard OpenEnv step logging
             action_str = f"{action.action_type}({action.target_id})"
 
             result = env.step(action)
@@ -168,12 +157,15 @@ EXAMPLE:
             if done:
                 break
 
-        # Check success based on actual environment health
+        # ── THE FIX: Clamp the score strictly between (0, 1) ──
         success = observation.health_score >= 1.0
-        score = 1.0 if success else max(0.0, observation.health_score)
+        raw_score = 1.0 if success else max(0.0, observation.health_score)
+        
+        # Force the score to be exactly 0.99 for a perfect run, and 0.01 for a total failure
+        score = max(0.01, min(0.99, raw_score))
 
     except Exception as e:
-        score = 0.0
+        score = 0.01  # Cannot be 0.0
         success = False
 
     finally:
@@ -184,10 +176,7 @@ EXAMPLE:
 
 def main():
     env = ClusterTriageEnv()
-    
-    # Run all 5 tasks
     tasks = ["easy", "medium", "hard", "very_hard", "nightmare"]
-    
     for task_id in tasks:
         run_task(env, task_id)
 
