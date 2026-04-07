@@ -1,31 +1,69 @@
+"""
+Inference Script — OpenEnv: Distributed Cluster Triage
+=======================================================
+Mandatory STDOUT format (parsed by the automated validator):
+
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
+"""
+
 import os
 import json
 import re
+from typing import List, Optional
 from openai import OpenAI
+from dotenv import load_dotenv
+
+
 from environment import ClusterTriageEnv
 from models import ClusterAction
+
+load_dotenv()
 
 # ── 1. Load Required Environment Variables ──────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Llama-70B")
+
+BENCHMARK = "cluster-triage"
 MAX_STEPS = 15
+SUCCESS_SCORE_THRESHOLD = 0.5
+
+MAX_REWARD = {
+    "easy":      1.0,
+    "medium":    1.0,
+    "hard":      1.0,
+    "very_hard": 1.0,
+    "nightmare": 1.0,
+}
 
 if not API_KEY:
     raise EnvironmentError("CRITICAL: HF_TOKEN or API_KEY environment variable is required.")
 
-# ── 2. Setup the LLM Client ──────────────────────────────────────────────────
 client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
 
-def parse_model_action(response_text: str) -> ClusterAction:
-    """
-    Extracts a ClusterAction from LLM output.
-    Handles JSON objects, markdown fences, and [action] tag format.
-    """
-    text = response_text.replace("```json", "").replace("```", "").strip()
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
-    # Try to parse JSON object
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+
+
+def parse_model_action(response_text: str) -> ClusterAction:
+    # 1. Strip out DeepSeek reasoning blocks!
+    text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+    
     match = re.search(r'\{.*?\}', text, re.DOTALL)
     if match:
         try:
@@ -34,42 +72,37 @@ def parse_model_action(response_text: str) -> ClusterAction:
                 return ClusterAction(**data)
         except Exception:
             pass
-
-    # Try [action] tag format (from sample inference template)
     match = re.search(r'\[action\]\s*(.*)', text, re.DOTALL | re.IGNORECASE)
     if match:
-        inner = match.group(1).strip()
         try:
-            data = json.loads(inner)
+            data = json.loads(match.group(1).strip())
             return ClusterAction(**data)
         except Exception:
             pass
-
     return ClusterAction(action_type="noop", target_id="none")
 
 
 def run_task(env: ClusterTriageEnv, task_id: str) -> float:
-    """
-    Runs a single task episode with the LLM agent.
-    Returns cumulative reward for the episode.
-    """
-    print(f"\n{'='*60}")
-    print(f"  Starting Task: {task_id.upper()}")
-    print(f"{'='*60}")
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
-    observation = env.reset(task=task_id)
-    history = []
-    cumulative_reward = 0.0
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
 
-    for step in range(1, MAX_STEPS + 1):
-        history_text = "\n".join(history) if history else "None."
+    try:
+        observation = env.reset(task=task_id)
+        history: List[str] = []
 
-        system_prompt = (
-            "You are an automated DevOps system. You cannot speak. "
-            "You can only output raw JSON commands. No explanations, no extra text."
-        )
+        for step in range(1, MAX_STEPS + 1):
+            history_text = "\n".join(history) if history else "None."
 
-        user_prompt = f"""You are an SRE agent triaging a distributed cluster failure.
+            system_prompt = (
+                "You are an automated DevOps system. You cannot speak. "
+                "You can only output raw JSON commands. No explanations, no extra text."
+            )
+
+            user_prompt = f"""You are an SRE agent triaging a distributed cluster failure.
 
 CURRENT CLUSTER STATE:
 {observation.model_dump_json(indent=2)}
@@ -82,6 +115,7 @@ RULES:
 2. Never restart a node whose disk_usage is above 50%. Clear its storage first.
 3. Clear nodes in order after all jobs are killed.
 4. Only restart nodes after their disk has been cleared.
+5. For nightmare: kill ALL 3 hydra jobs before clearing ANY storage.
 
 Respond with EXACTLY ONE JSON object. No other text.
 Valid action_type values: "kill_job", "restart_node", "clear_temp_storage", "noop"
@@ -90,70 +124,72 @@ EXAMPLE:
 {{"action_type": "kill_job", "target_id": "job_rogue_99"}}
 """
 
-        try:
-            completion = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
+            last_error = None
+            try:
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=400  # ADDED: crucial for DeepSeek to finish thinking!
+                )
+                response_text = completion.choices[0].message.content or ""
+            except Exception as e:
+                last_error = str(e)
+                log_step(step=step, action="noop", reward=0.0, done=True, error=last_error)
+                rewards.append(0.0)
+                steps_taken = step
+                break
+
+            action = parse_model_action(response_text)
+            
+            # Compress action for standard OpenEnv step logging
+            action_str = f"{action.action_type}({action.target_id})"
+
+            result = env.step(action)
+            observation = result.observation
+            reward = result.reward
+            done = result.done
+            msg = result.info.get("message", "")
+
+            rewards.append(reward)
+            steps_taken = step
+
+            log_step(step=step, action=action_str, reward=reward, done=done, error=None)
+
+            history.append(
+                f"Step {step}: {action.action_type} on {action.target_id} -> reward={reward:.2f} | {msg}"
             )
-            response_text = completion.choices[0].message.content or ""
-        except Exception as e:
-            print(f"  [API ERROR] Step {step}: {e}")
-            break
+            if action.action_type == "noop":
+                history.append("WARNING: Last output was invalid JSON. Output ONLY a JSON object.")
 
-        action = parse_model_action(response_text)
-        print(f"  Step {step:>2} | Action: {action.action_type:<20} | Target: {action.target_id}")
+            if done:
+                break
 
-        result = env.step(action)
-        observation = result.observation
-        reward = result.reward
-        done = result.done
-        msg = result.info.get("message", "")
+        # Check success based on actual environment health
+        success = observation.health_score >= 1.0
+        score = 1.0 if success else max(0.0, observation.health_score)
 
-        cumulative_reward += reward
-        history.append(
-            f"Step {step}: {action.action_type} on {action.target_id} "
-            f"→ reward={reward:.2f} | msg={msg}"
-        )
+    except Exception as e:
+        score = 0.0
+        success = False
 
-        print(f"         | Reward: {reward:+.3f} | Done: {done} | {msg}")
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
-        if done:
-            print(f"\n  ✓ Task '{task_id.upper()}' completed in {step} step(s).")
-            break
-
-        if action.action_type == "noop":
-            history.append("WARNING: Last output was invalid JSON. Output ONLY a JSON object.")
-
-    print(f"  Cumulative Reward: {cumulative_reward:.3f}")
-    return cumulative_reward
+    return score
 
 
 def main():
-    """Run baseline inference on all 3 required tasks."""
     env = ClusterTriageEnv()
-    tasks = ["easy", "medium", "hard"]
-
-    print("\n" + "="*60)
-    print("  OpenEnv: Distributed Cluster Triage — Baseline Run")
-    print(f"  Model: {MODEL_NAME}")
-    print("="*60)
-
-    scores = {}
+    
+    # Run all 5 tasks
+    tasks = ["easy", "medium", "hard", "very_hard", "nightmare"]
+    
     for task_id in tasks:
-        scores[task_id] = run_task(env, task_id)
-
-    print("\n" + "="*60)
-    print("  BASELINE SCORES SUMMARY")
-    print("="*60)
-    for task_id, score in scores.items():
-        print(f"  {task_id:<12}: {score:.3f}")
-    total = sum(scores.values()) / len(scores)
-    print(f"  {'AVERAGE':<12}: {total:.3f}")
-    print("="*60 + "\n")
+        run_task(env, task_id)
 
 
 if __name__ == "__main__":
