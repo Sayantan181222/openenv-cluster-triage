@@ -12,7 +12,7 @@ WHY THIS MODEL WINS HACKATHONS:
   • More runs in the same time budget = more fixes = higher final score
 
 ITERATION STRATEGY (how to actually improve this):
-  Run 1 (smoke):      5 steps/stage, 12 prompts/stage → just check metrics
+  Run 1 (smoke):      8 steps/stage, 16 prompts/stage → just check metrics
   Run 2 (diagnosis):  20 steps/stage, 30 prompts → watch reward_std, kl
   Run 3 (production): 60-100 steps/stage, 80-120 prompts → real training
   Run 4+ (iterate):   Re-run only failing stages with adjusted hyperparams
@@ -77,7 +77,7 @@ GOOGLE COLAB SETUP:
   # Cell 6 — push trained adapter to HF Hub (optional)
   from huggingface_hub import HfApi
   api = HfApi()
-  api.upload_folder(folder_path="cluster-triage-lora",
+  api.upload_folder(folder_path="cluster-triage-lora-qwen1.5b",
                     repo_id="<YOUR_HF_USERNAME>/cluster-triage-qwen-1.5b",
                     repo_type="model")
 """

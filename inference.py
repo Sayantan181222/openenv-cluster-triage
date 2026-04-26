@@ -26,8 +26,16 @@ API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Llama-70B")
 
 BENCHMARK = "cluster-triage"
-MAX_STEPS = 15
 SUCCESS_SCORE_THRESHOLD = 0.5
+
+# Per-task max steps — must match environment.py and openenv.yaml
+TASK_MAX_STEPS = {
+    "easy":      5,
+    "medium":    10,
+    "hard":      15,
+    "very_hard": 20,
+    "nightmare": 25,
+}
 
 if not API_KEY:
     raise EnvironmentError("CRITICAL: HF_TOKEN or API_KEY environment variable is required.")
@@ -85,7 +93,8 @@ def run_task(env: ClusterTriageEnv, task_id: str) -> float:
         observation = env.reset(task=task_id)
         history: List[str] = []
 
-        for step in range(1, MAX_STEPS + 1):
+        max_steps = TASK_MAX_STEPS.get(task_id, 15)
+        for step in range(1, max_steps + 1):
             history_text = "\n".join(history) if history else "None."
 
             system_prompt = (

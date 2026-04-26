@@ -22,7 +22,7 @@ This environment is built as a complete, containerized Reinforcement Learning (R
 
 1. **The Simulation Engine (`environment.py`):** An OpenEnv-compliant state machine that tracks node health, RAM/Disk usage, active jobs, and enforces strict logic gates (e.g., you cannot restart a node if its disk is full; you must kill Hydra malware before clearing storage).
 2. **The Backend API (`FastAPI`):** Exposes standard programmatic RL endpoints (`/reset`, `/step`, `/state`, `/health`) allowing external scripts and evaluators to interact with the environment headlessly.
-3. **The Web Dashboard (`Gradio`):** Mounted directly on top of the FastAPI server, this provides a dark-mode, 3-column "SRE Command Center" for humans to interactively step through the simulation and watch the LLM make decisions in real-time.
+3. **The Web Dashboard (HTML/JS):** A custom dark-mode "SRE Command Center" frontend served as static files by FastAPI, allowing humans to interactively step through the simulation and watch the LLM make decisions in real-time.
 4. **The Agent (`inference.py` / `OpenAI Client`):** Uses the `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` model via the Hugging Face Serverless API to analyze the observation JSON and output strict, precise JSON action commands.
 
 ---
@@ -68,11 +68,11 @@ You can run this project in three different ways depending on your needs.
 The easiest way to evaluate the environment is via the public Hugging Face Space. The UI acts as a step-by-step RL debugger.
 
 1. **Access the Dashboard:** Open the Hugging Face Space URL.
-2. **Select Threat Level:** Use the radio buttons on the left to choose a scenario. The *Active Incident Briefing* will update with your mission constraints.
-3. **Initialize the Environment:** Click the **🔄 Reset** button. This boots up the simulation and populates the *Live Node Status* telemetry grid.
-4. **Deploy the Agent:** Click the purple **▶ AGENT STEP** button. The LLM will evaluate the state and make exactly *one* move. 
-5. **Observe the Triage:** Look at the right-side panel. You will see the agent's command in the Terminal, the resulting Step Reward (+/-), and the dynamic Reward History bar graph update.
-6. **Iterate:** Continue clicking **▶ AGENT STEP** until the terminal declares `SYSTEM NOMINAL`.
+2. **Select Threat Level:** Use the sidebar on the left to choose a scenario (Easy through Nightmare). The Active Incident Briefing will update with your mission constraints.
+3. **Initialize the Environment:** Click the **RESET** button. This boots up the simulation and populates the live node status telemetry grid.
+4. **Deploy the Agent:** Click the **AGENT STEP** button. The LLM will evaluate the state and make exactly *one* move.
+5. **Observe the Triage:** Look at the terminal panel. You will see the agent's command, the resulting Step Reward (+/-), and the dynamic reward history updating.
+6. **Iterate:** Continue clicking **AGENT STEP** until the terminal declares `SYSTEM NOMINAL`.
 
 ### Method 2: Local Docker (Production Simulation)
 Run the exact containerized environment that Hugging Face uses, locally on your machine.

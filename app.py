@@ -40,7 +40,7 @@ api_env = ClusterTriageEnv()
 action_history = []  # Maintain history for LLM prompting
 
 # ── FastAPI App ──────────────────────────────────────────────────────────────
-fastapi_app = FastAPI(
+app = FastAPI(
     title="OpenEnv: Distributed Cluster Triage",
     description=(
         "An OpenEnv-compliant RL environment simulating a 4-node enterprise "
@@ -51,8 +51,9 @@ fastapi_app = FastAPI(
 )
 
 def extract_action_from_llm(response_text: str) -> ClusterAction:
-    """Parse LLM output into a ClusterAction."""
-    text = response_text.replace("```json", "").replace("```", "").strip()
+    """Parse LLM output into a ClusterAction. Strips DeepSeek-R1 <think> blocks."""
+    text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
+    text = text.replace("```json", "").replace("```", "").strip()
     match = re.search(r'\{.*?\}', text, re.DOTALL)
     if match:
         try:
@@ -63,12 +64,12 @@ def extract_action_from_llm(response_text: str) -> ClusterAction:
             pass
     return ClusterAction(action_type="noop", target_id="none")
 
-@fastapi_app.get("/health")
+@app.get("/health")
 def health():
     """Health check endpoint — returns 200 OK."""
     return {"status": "ok", "env": "cluster-triage", "version": "1.0.0"}
 
-@fastapi_app.get("/agents")
+@app.get("/agents")
 def get_agents():
     return JSONResponse(content=[
         {
@@ -86,7 +87,7 @@ def get_agents():
         }
     ])
 
-@fastapi_app.get("/tasks")
+@app.get("/tasks")
 def list_tasks(agent_id: Optional[str] = None):
     """List all available tasks with difficulty metadata."""
     return {
@@ -99,7 +100,7 @@ def list_tasks(agent_id: Optional[str] = None):
         ]
     }
 
-@fastapi_app.post("/reset")
+@app.post("/reset")
 def reset(request: ResetRequest = None):
     """
     Reset the environment for a given task.
@@ -112,7 +113,7 @@ def reset(request: ResetRequest = None):
     action_history = []
     return JSONResponse(content=obs.model_dump())
 
-@fastapi_app.post("/step")
+@app.post("/step")
 def step(action: ClusterAction):
     """
     Execute one action in the environment (used by validate.sh).
@@ -124,7 +125,7 @@ class AgentStepRequest(BaseModel):
     agent_id: Optional[str] = "cluster_triage"
     task: str = "easy"
 
-@fastapi_app.post("/agent/step")
+@app.post("/agent/step")
 def agent_step(req: AgentStepRequest):
     """
     Uses LLM to perform one step. Replaces the old Gradio button logic.
@@ -184,13 +185,13 @@ Valid action_type values: "kill_job", "restart_node", "clear_temp_storage", "noo
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM API Error: {str(e)}")
 
-@fastapi_app.get("/state")
+@app.get("/state")
 def state():
     """Return the current cluster observation without advancing the episode."""
     return JSONResponse(content=api_env.state().model_dump())
 
 # Serve static files including index.html at root
-fastapi_app.mount("/", StaticFiles(directory="static", html=True), name="static")
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 if __name__ == "__main__":
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=7860, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=7860, log_level="info")

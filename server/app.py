@@ -5,7 +5,7 @@ import uvicorn
 # Point back to the root directory so it can find your actual app
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import the fully mounted FastAPI + Gradio app from the root app.py
+# Import the FastAPI app from the root app.py
 from app import app
 
 def main():
