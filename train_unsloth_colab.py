@@ -131,11 +131,11 @@ TASK_MAX_STEPS = {
 CURRICULUM_CONFIGS = {
     "smoke": [
         # Quick sanity-check. Only goal: see non-zero reward_std.
-        ("easy",      5,  12),
-        ("medium",    5,  12),
-        ("hard",      5,  12),
-        ("very_hard", 5,  12),
-        ("nightmare", 5,  12),
+        ("easy",      8,  16),
+        ("medium",    8,  16),
+        ("hard",      8,  16),
+        ("very_hard", 8,  16),
+        ("nightmare", 8,  16),
     ],
     "diagnosis": [
         # Enough steps to see if learning signal is real.
