@@ -810,7 +810,7 @@ for stage_idx, (task_id, grpo_steps, num_prompts) in enumerate(CURRICULUM):
         output_dir                  = f"checkpoints/stage_{stage_idx+1}_{task_id}",
         learning_rate               = 3e-5,      # slightly higher (gradients were near-zero)
         per_device_train_batch_size = 1,
-        gradient_accumulation_steps = 4,
+        gradient_accumulation_steps = 6,
         num_generations             = 6,
         max_completion_length       = 200,
         max_prompt_length           = 1024,
@@ -822,7 +822,7 @@ for stage_idx, (task_id, grpo_steps, num_prompts) in enumerate(CURRICULUM):
         report_to                   = "none",
         remove_unused_columns       = False,
         temperature                 = 1.0,       # FIX 2: GRPO-level sampling temperature
-        kl_coef                     = 0.01,      # small but non-zero — keeps policy sane
+        beta                        = 0.01,      # small but non-zero — keeps policy sane
     )
 
     trainer = GRPOTrainer(
