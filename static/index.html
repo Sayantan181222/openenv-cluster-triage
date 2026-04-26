@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>OpenEnv · Cluster SRE Command Center</title>
+  <meta name="description" content="OpenEnv Distributed Cluster Triage — Interactive RL environment where an AI agent acts as an SRE triaging infrastructure failures.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    /* ── DESIGN TOKENS ─────────────────────────────────────── */
+    :root {
+      --bg:        #09090b;
+      --surface:   #131316;
+      --elevated:  #1c1c1f;
+      --border:    #232328;
+      --border2:   #3f3f46;
+      --accent:    #8b5cf6;
+      --accent-h:  #7c3aed;
+      --accent-glow: rgba(139,92,246,0.15);
+      --green:     #10b981;
+      --red:       #ef4444;
+      --yellow:    #eab308;
+      --blue:      #3b82f6;
+      --cyan:      #22d3ee;
+      --text:      #e4e4e7;
+      --muted:     #71717a;
+      --subtle:    #a1a1aa;
+      --mono:      'IBM Plex Mono', 'Courier New', monospace;
+      --sans:      'Inter', system-ui, sans-serif;
+      --r:         8px;
+      --r-lg:      12px;
+    }
+
+    /* ── RESET ──────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { font-size: 14px; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      pointer-events: none; z-index: 0;
+      background-image:
+        linear-gradient(rgba(139,92,246,0.02) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(139,92,246,0.02) 1px, transparent 1px);
+      background-size: 48px 48px;
+    }
+
+    /* ── LAYOUT ─────────────────────────────────────────────── */
+    .app {
+      position: relative; z-index: 1;
+      max-width: 1480px; margin: 0 auto;
+      padding: 12px; display: flex;
+      flex-direction: column; gap: 10px;
+    }
+
+    /* ── CARDS ──────────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      overflow: hidden;
+    }
+    .card-header {
+      display: flex; align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      gap: 8px; min-height: 34px;
+    }
+    .card-title {
+      font-family: var(--mono);
+      font-size: 9px; font-weight: 700;
+      color: var(--muted);
+      letter-spacing: 2px; text-transform: uppercase;
+    }
+    .card-body { padding: 10px; }
+
+    /* ── HEADER ─────────────────────────────────────────────── */
+    .header {
+      display: flex; align-items: center;
+      justify-content: space-between;
+      padding: 9px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      gap: 12px; flex-wrap: wrap;
+    }
+    .logo { display: flex; align-items: baseline; gap: 8px; }
+    .logo-name {
+      font-family: var(--mono); font-size: 16px; font-weight: 700;
+      background: linear-gradient(135deg, var(--accent), #a78bfa);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .logo-sub { font-family: var(--mono); font-size: 9px; color: var(--muted); letter-spacing: 1px; }
+    .header-right { display: flex; align-items: center; gap: 8px; }
+    .status-badge {
+      display: flex; align-items: center; gap: 6px;
+      padding: 4px 10px;
+      background: #0a0a0d;
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      font-family: var(--mono); font-size: 9px; color: var(--muted);
+    }
+    .status-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--muted); flex-shrink: 0;
+    }
+    .status-dot.live { background: var(--green); animation: pulse-dot 2s infinite; }
+    .status-dot.err  { background: var(--red); }
+    @keyframes pulse-dot {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.4); }
+      50%       { box-shadow: 0 0 0 4px rgba(16,185,129,0); }
+    }
+    .version-tag {
+      font-family: var(--mono); font-size: 9px; color: var(--accent);
+      background: rgba(139,92,246,0.1);
+      border: 1px solid rgba(139,92,246,0.25);
+      padding: 2px 8px; border-radius: 100px;
+    }
+
+    /* ══════════════════════════════════════════════════════════
+       MAIN 3-COL GRID
+    ═══════════════════════════════════════════════════════════ */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 220px 1fr 210px;
+      gap: 10px; align-items: start;
+    }
+
+    /* ══════════════════════════════════════════════════════════
+       LEFT SIDEBAR: AGENTS → TASKS
+       ──────────────────────────────────────────────────────────
+    ═══════════════════════════════════════════════════════════ */
+    .sidebar-inner { display: flex; flex-direction: column; gap: 8px; }
+
+    /* Agent group = agent header + collapsible task list */
+    .agent-group { margin-bottom: 2px; }
+    .agent-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 9px 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      cursor: pointer; transition: all 0.15s;
+      background: #0e0e11;
+      user-select: none;
+    }
+    .agent-header:hover { border-color: var(--border2); background: #141417; }
+    .agent-header.active {
+      border-color: var(--accent);
+      background: rgba(139,92,246,0.06);
+      box-shadow: 0 0 8px var(--accent-glow);
+    }
+    .agent-icon { font-size: 16px; flex-shrink: 0; }
+    .agent-header-text { flex: 1; min-width: 0; }
+    .agent-name { font-size: 12px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .agent-desc-mini { font-family: var(--mono); font-size: 8px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+    .agent-chevron {
+      font-family: var(--mono); font-size: 10px; color: var(--muted);
+      transition: transform 0.2s;
+    }
+    .agent-header.active .agent-chevron { transform: rotate(90deg); color: var(--accent); }
+
+    /* Task list inside agent */
+    .task-list {
+      max-height: 0; overflow: hidden;
+      transition: max-height 0.3s ease;
+      padding-left: 12px;
+    }
+    .task-list.open { max-height: 500px; }
+    .task-list-inner { padding: 4px 0 2px; display: flex; flex-direction: column; gap: 3px; }
+
+    .task-item {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 9px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      cursor: pointer; transition: all 0.12s;
+      background: transparent;
+    }
+    .task-item:hover { background: #141417; border-color: var(--border); }
+    .task-item.selected {
+      background: rgba(139,92,246,0.08);
+      border-color: rgba(139,92,246,0.3);
+    }
+    .task-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%; flex-shrink: 0;
+    }
+    .task-item-name { font-size: 11px; color: var(--text); flex: 1; }
+    .task-item-diff {
+      font-family: var(--mono); font-size: 8px; font-weight: 700;
+      padding: 1px 5px; border-radius: 3px;
+      letter-spacing: 0.5px;
+    }
+
+    /* "Add Agent" placeholder */
+    .add-agent-slot {
+      display: flex; align-items: center; gap: 8px;
+      padding: 9px 10px;
+      border: 1px dashed var(--border2);
+      border-radius: var(--r);
+      opacity: 0.4; cursor: default;
+      margin-top: 2px;
+    }
+    .add-agent-icon { font-size: 14px; color: var(--muted); }
+    .add-agent-text { font-family: var(--mono); font-size: 8px; color: var(--muted); letter-spacing: 1px; line-height: 1.5; }
+
+    /* ── CONTROL BUTTONS ────────────────────────────────────── */
+    .ctrl-btns { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
+    .btn {
+      display: flex; align-items: center; justify-content: center; gap: 5px;
+      padding: 8px 12px; border-radius: var(--r); border: none;
+      font-family: var(--mono); font-size: 9px;
+      font-weight: 700; letter-spacing: 1px;
+      cursor: pointer; transition: all 0.15s;
+      text-transform: uppercase; width: 100%;
+    }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) {
+      background: var(--accent-h); transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(139,92,246,0.4);
+    }
+    .btn-ghost { background: #0e0e11; color: var(--subtle); border: 1px solid var(--border); }
+    .btn-ghost:hover:not(:disabled) { border-color: var(--border2); color: var(--text); }
+    .spinner {
+      width: 11px; height: 11px;
+      border: 2px solid rgba(255,255,255,0.2); border-top-color: #fff;
+      border-radius: 50%; animation: spin 0.7s linear infinite; display: none;
+    }
+    .spinner.on { display: block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── CENTER PANEL ────────────────────────────────────────── */
+    .center-panel { display: flex; flex-direction: column; gap: 10px; }
+    .briefing-text {
+      font-family: var(--mono); font-size: 11px;
+      color: var(--subtle); line-height: 1.8;
+      white-space: pre-wrap; padding: 10px;
+      background: #0a0a0d; border-radius: var(--r);
+      min-height: 80px;
+    }
+
+    /* ── NODE GRID ───────────────────────────────────────────── */
+    .node-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .node-card {
+      background: #0a0a0d;
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 8px 10px;
+      border-left-width: 3px;
+      transition: border-color 0.4s;
+    }
+    .node-card.healthy     { border-left-color: var(--green);  }
+    .node-card.offline     { border-left-color: var(--red);    }
+    .node-card.high_memory { border-left-color: var(--yellow); }
+    .node-card.disk_full   { border-left-color: var(--yellow); }
+    .node-card.unknown     { border-left-color: var(--border2);}
+    .node-id { font-family: var(--mono); font-size: 11px; font-weight: 700; }
+    .node-status {
+      font-family: var(--mono); font-size: 8px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 1px; margin: 2px 0 5px;
+    }
+    .node-status.healthy     { color: var(--green); }
+    .node-status.offline     { color: var(--red); }
+    .node-status.high_memory { color: var(--yellow); }
+    .node-status.disk_full   { color: var(--yellow); }
+    .node-status.unknown     { color: var(--muted); }
+    .node-metrics {
+      display: flex; justify-content: space-between;
+      font-family: var(--mono); font-size: 9px; color: var(--muted);
+    }
+    .metric-bar { height: 2px; background: var(--border); border-radius: 2px; margin-top: 4px; overflow: hidden; }
+    .metric-bar-fill { height: 100%; border-radius: 2px; transition: width 0.5s ease; }
+
+    /* ── SCORE PANEL (right col) ─────────────────────────────── */
+    .score-number {
+      font-family: var(--mono); font-size: 44px;
+      font-weight: 700; line-height: 1;
+      text-align: center; transition: color 0.3s;
+    }
+    .score-label {
+      font-family: var(--mono); font-size: 8px;
+      color: var(--muted); letter-spacing: 2px;
+      text-align: center; text-transform: uppercase; margin-top: 4px;
+    }
+    .score-divider { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
+    .score-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+    .score-row-lbl { font-family: var(--mono); font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+    .score-row-val { font-family: var(--mono); font-size: 15px; font-weight: 700; color: var(--green); }
+    .reward-bars {
+      display: flex; align-items: flex-end; height: 45px; gap: 3px;
+      background: rgba(0,0,0,0.3); border-radius: 5px 5px 0 0; padding: 6px 6px 0;
+    }
+    .rbar { flex: 1; border-radius: 2px 2px 0 0; opacity: 0.85; min-height: 3px; transition: height 0.3s; }
+    .rbar.pos { background: var(--green); } .rbar.neg { background: var(--red); }
+    .rbar-axis { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 8px; color: var(--muted); margin-top: 3px; }
+
+    /* ── TERMINAL ────────────────────────────────────────────── */
+    .terminal {
+      background: #050507; border-radius: var(--r);
+      padding: 10px 12px; height: 220px;
+      overflow-y: auto;
+      font-family: var(--mono); font-size: 11px; line-height: 1.8;
+      border: 1px solid #1a1a1f;
+    }
+    .terminal::-webkit-scrollbar { width: 3px; }
+    .terminal::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+    .t-sys   { color: var(--muted); }
+    .t-reset { color: #a78bfa; font-weight: 500; }
+    .t-step  { color: var(--text); }
+    .t-rpos  { color: var(--green); font-weight: 700; }
+    .t-rneg  { color: var(--red); font-weight: 700; }
+    .t-ok    { color: var(--green); }
+    .t-warn  { color: var(--yellow); }
+    .t-err   { color: var(--red); }
+    .t-info  { color: var(--blue); }
+
+    /* ── BOTTOM GRID ──────────────────────────────────────────── */
+    .bottom-grid { display: grid; grid-template-columns: 1fr 310px; gap: 10px; }
+    .api-pills { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
+    .api-pill {
+      display: flex; align-items: center; gap: 3px;
+      padding: 3px 8px; background: #0a0a0d;
+      border: 1px solid var(--border); border-radius: 100px;
+      font-family: var(--mono); font-size: 8px; color: var(--muted);
+      cursor: pointer; transition: all 0.15s;
+    }
+    .api-pill:hover { border-color: var(--accent); color: var(--accent); }
+    .m-get  { color: var(--green); font-weight: 700; }
+    .m-post { color: var(--cyan); font-weight: 700; }
+    .api-output {
+      background: #050507; border: 1px solid var(--border); border-radius: var(--r);
+      padding: 8px 10px; font-family: var(--mono); font-size: 9px;
+      color: #88aacc; line-height: 1.7; white-space: pre-wrap; max-height: 100px; overflow-y: auto;
+    }
+
+    /* ── UTILITY ──────────────────────────────────────────────── */
+    .tag {
+      font-family: var(--mono); font-size: 8px; color: var(--muted);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      padding: 2px 6px; border-radius: 4px;
+    }
+    .flex-row { display: flex; align-items: center; gap: 6px; }
+    .footer {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 4px; font-family: var(--mono); font-size: 8px;
+      color: var(--muted); flex-wrap: wrap; gap: 4px;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(3px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .fade-in { animation: fadeIn 0.2s ease forwards; }
+
+    /* ── RESPONSIVE ──────────────────────────────────────────── */
+    @media (max-width: 1100px) { .main-grid { grid-template-columns: 200px 1fr 195px; } }
+    @media (max-width: 900px)  { .main-grid { grid-template-columns: 1fr; } .bottom-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ── HEADER ── -->
+  <header class="header" id="appHeader">
+    <div class="logo">
+      <span class="logo-name">OpenEnv</span>
+      <span class="logo-sub">Cluster SRE · Distributed Triage</span>
+    </div>
+    <div class="header-right">
+      <div class="status-badge">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">Connecting...</span>
+      </div>
+      <span class="version-tag" id="versionTag">v1.0.0</span>
+    </div>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════
+       MAIN 3-COLUMN GRID
+  ════════════════════════════════════════════════════════ -->
+  <div class="main-grid">
+
+    <!-- ── COL 1: AGENTS SIDEBAR ──────────────────────────── -->
+    <div class="card" id="sidebarCard">
+      <div class="card-header">
+        <span class="card-title">🤖 Agents</span>
+        <span class="tag" id="agentCountTag">Loading</span>
+      </div>
+      <div class="card-body">
+        <div class="sidebar-inner" id="sidebarAgents">
+          <div style="font-family:var(--mono);font-size:10px;color:var(--muted);padding:8px;">Discovering agents...</div>
+        </div>
+
+        <!-- Controls -->
+        <div class="ctrl-btns">
+          <button class="btn btn-ghost" id="btnState" onclick="doState()">📊 State</button>
+          <button class="btn btn-ghost" id="btnReset" onclick="doReset()">🔄 Reset</button>
+          <button class="btn btn-primary" id="btnStep" onclick="doAgentStep()">
+            <div class="spinner" id="stepSpinner"></div>
+            <span id="stepBtnTxt">▶ Agent Step</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── COL 2: BRIEFING + NODES ────────────────────────── -->
+    <div class="center-panel" id="centerPanel">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">📋 Active Incident Briefing</span>
+          <div class="flex-row">
+            <span class="tag" id="stepCounter">Step 0</span>
+            <span class="tag" id="healthTag">Health: —</span>
+          </div>
+        </div>
+        <div class="card-body" style="padding:0;">
+          <div class="briefing-text" id="briefingText">Select an agent and task from the sidebar, then click 🔄 Reset...</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">🖥️ Live Node Telemetry</span>
+          <span id="nodeSub" style="font-family:var(--mono);font-size:8px;color:var(--muted);">4 nodes · awaiting reset</span>
+        </div>
+        <div class="card-body">
+          <div class="node-grid" id="nodeGrid">
+            <div class="node-card unknown"><div class="node-id">worker_01</div><div class="node-status unknown">standby</div><div class="node-metrics"><span>Disk —</span><span>RAM —</span></div></div>
+            <div class="node-card unknown"><div class="node-id">worker_02</div><div class="node-status unknown">standby</div><div class="node-metrics"><span>Disk —</span><span>RAM —</span></div></div>
+            <div class="node-card unknown"><div class="node-id">worker_03</div><div class="node-status unknown">standby</div><div class="node-metrics"><span>Disk —</span><span>RAM —</span></div></div>
+            <div class="node-card unknown"><div class="node-id">worker_04</div><div class="node-status unknown">standby</div><div class="node-metrics"><span>Disk —</span><span>RAM —</span></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── COL 3: EPISODE SCORE ───────────────────────────── -->
+    <div class="card" id="scoreCard">
+      <div class="card-header">
+        <span class="card-title">📈 Score</span>
+        <span id="doneTag" style="display:none;font-family:var(--mono);font-size:8px;color:var(--green);font-weight:700;letter-spacing:1px;">✓ DONE</span>
+      </div>
+      <div class="card-body">
+        <div class="score-number" id="scoreReward" style="color:var(--muted);">+0.000</div>
+        <div class="score-label">Step Reward</div>
+        <hr class="score-divider">
+        <div class="score-row">
+          <span class="score-row-lbl">Health</span>
+          <span class="score-row-val" id="scoreHealth">—</span>
+        </div>
+        <div class="score-row">
+          <span class="score-row-lbl">Total</span>
+          <span style="font-family:var(--mono);font-size:14px;font-weight:700;color:var(--subtle);" id="scoreTotal">0.000</span>
+        </div>
+        <hr class="score-divider">
+        <div style="font-family:var(--mono);font-size:8px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px;">Reward History</div>
+        <div class="reward-bars" id="rewardBars">
+          <div style="font-family:var(--mono);font-size:8px;color:var(--muted);margin:auto;">No steps yet</div>
+        </div>
+        <div class="rbar-axis"><span>+1.0</span><span id="avgRwd">avg —</span><span>-1.0</span></div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--muted);text-align:center;margin-top:6px;" id="stepCounterScore">0 / — steps</div>
+      </div>
+    </div>
+  </div><!-- /.main-grid -->
+
+  <!-- ═══════════════════════════════════════════════════════
+       BOTTOM GRID: TERMINAL + SIDE PANELS
+  ════════════════════════════════════════════════════════ -->
+  <div class="bottom-grid">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">💻 Agent Terminal</span>
+        <div class="flex-row">
+          <div class="spinner" id="termSpinner"></div>
+          <span id="llmTag" style="font-family:var(--mono);font-size:8px;color:var(--accent);display:none;letter-spacing:1px;">LLM THINKING...</span>
+          <button class="btn btn-ghost" style="padding:3px 8px;font-size:8px;width:auto;" onclick="clearTerminal()">CLEAR</button>
+        </div>
+      </div>
+      <div class="card-body" style="padding:0 10px 10px;">
+        <div class="terminal" id="terminal">
+          <div class="t-sys">// OpenEnv Cluster SRE Command Center</div>
+          <div class="t-sys">// Select an agent → pick a task → click Reset → Agent Step</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <!-- API EXPLORER -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">🔌 API Explorer</span>
+          <span style="font-family:var(--mono);font-size:8px;color:var(--muted);" id="apiBaseUrl"></span>
+        </div>
+        <div class="card-body">
+          <div class="api-pills">
+            <div class="api-pill" onclick="apiTest('/health','GET')"><span class="m-get">GET</span>/health</div>
+            <div class="api-pill" onclick="apiTestTasks()"><span class="m-get">GET</span>/tasks</div>
+            <div class="api-pill" onclick="apiTest('/agents','GET')"><span class="m-get">GET</span>/agents</div>
+            <div class="api-pill" onclick="apiTest('/state','GET')"><span class="m-get">GET</span>/state</div>
+            <div class="api-pill" onclick="apiTestReset()"><span class="m-post">POST</span>/reset</div>
+            <div class="api-pill" onclick="apiTestAgentStep()"><span class="m-post">POST</span>/agent/step</div>
+          </div>
+          <div class="api-output" id="apiOutput">// Click any endpoint to test</div>
+        </div>
+      </div>
+      <!-- JOBS / ALERTS -->
+      <div class="card">
+        <div class="card-header"><span class="card-title">⚙️ Active Jobs</span></div>
+        <div class="card-body"><div id="jobsList" style="font-family:var(--mono);font-size:9px;color:var(--muted);">No active jobs</div></div>
+      </div>
+      <div class="card">
+        <div class="card-header"><span class="card-title">🚨 Alerts</span></div>
+        <div class="card-body"><div id="alertsList" style="font-family:var(--mono);font-size:8px;color:var(--muted);line-height:1.7;">—</div></div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="footer">
+    <span>OpenEnv · Cluster SRE · Distributed Triage</span>
+    <span id="footerInfo" style="color:var(--accent);"></span>
+    <span>FastAPI + HTML/CSS/JS · Port 7860</span>
+  </footer>
+</div>
+
+<script>
+'use strict';
+
+/* ════════════════════════════════════════════════════
+   STATE
+════════════════════════════════════════════════════ */
+var BASE             = window.location.origin;
+var selectedAgentId  = null;
+var selectedTaskId   = null;
+var selectedTaskMeta = null;
+var agentsData       = [];
+var rewardHistory    = [];
+var totalReward      = 0;
+var stepCount        = 0;
+var maxSteps         = 25;
+var episodeDone      = false;
+var isRunning        = false;
+
+var TASK_DESCS = {
+  easy:
+    '🟢 EASY — The Stuck Job\n\n' +
+    'A single rogue MapReduce job is stuck in an infinite loop,\nconsuming all RAM on worker_01.\n\n' +
+    'Goal: Kill the rogue job (job_rogue_99).\nExpected Steps: 1',
+  medium:
+    '🟡 MEDIUM — The Full Disk\n\n' +
+    'Worker node worker_03 has hit 99.9% disk capacity.\nAll writes are failing.\n\n' +
+    'Goal: Clear the storage, then restart the node safely.\nExpected Steps: 2',
+  hard:
+    '🟠 HARD — The Cascade Failure\n\n' +
+    'job_rogue_99 caused a HDFS replication storm,\ncrashing Nodes 1 & 2. Failover traffic is\noverloading Nodes 3 & 4.\n\n' +
+    'Goal: Kill root job → clear worker_01 & worker_02 → restart both.\nExpected Steps: 5',
+  very_hard:
+    '🔴 VERY HARD — Multi-Vector Attack\n\n' +
+    'Two simultaneous malware jobs:\n  • disk-filling log spammer (worker_01/02)\n  • RAM-hogging crypto miner (worker_03/04)\n\n' +
+    'Goal: Kill BOTH jobs → clear dead nodes → reboot them.\nExpected Steps: 6',
+  nightmare:
+    '☠️ NIGHTMARE — The Hydra Protocol\n\n' +
+    'Total cluster collapse. All 4 nodes offline.\nTHREE self-replicating malware jobs are writing\ngarbage data to every disk simultaneously.\n\n' +
+    '⚠️ If ANY Hydra survives, it will instantly refill cleared storage!\n\n' +
+    'Goal: Kill ALL 3 Hydras → clear all 4 nodes → restart all 4.\nExpected Steps: 11'
+};
+
+function apiFetch(path, method, body) {
+  var opts = { method: method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store' };
+  if (body !== null && body !== undefined) opts.body = JSON.stringify(body);
+  return fetch(BASE + path, opts)
+    .then(function (r) {
+      var ct = r.headers.get('content-type') || '';
+      if (ct.indexOf('json') < 0) return r.text().then(function (t) { return { ok: false, data: null, err: 'HTTP ' + r.status }; });
+      return r.json().then(function (d) {
+        if (!r.ok) return { ok: false, data: null, err: (d && d.detail) ? String(d.detail) : 'HTTP ' + r.status };
+        return { ok: true, data: d, err: null };
+      });
+    })
+    .catch(function (e) { return { ok: false, data: null, err: e.message }; });
+}
+
+function tlog(cls, txt) {
+  var el = document.getElementById('terminal');
+  var d  = document.createElement('div');
+  d.className = cls;
+  d.textContent = txt;
+  el.appendChild(d);
+  el.scrollTop = el.scrollHeight;
+}
+function clearTerminal() {
+  document.getElementById('terminal').innerHTML = '<div class="t-sys">// Terminal cleared</div>';
+}
+
+function loadAgents() {
+  apiFetch('/agents', 'GET', null).then(function (res) {
+    var container = document.getElementById('sidebarAgents');
+    if (!res.ok) {
+      container.innerHTML = '<div style="font-family:var(--mono);font-size:10px;color:var(--red);">Failed: ' + res.err + '</div>';
+      return;
+    }
+    agentsData = res.data;
+    container.innerHTML = '';
+
+    agentsData.forEach(function (agent, idx) {
+      var group = document.createElement('div');
+      group.className = 'agent-group';
+      group.id = 'ag_' + agent.id;
+
+      var header = document.createElement('div');
+      header.className = 'agent-header';
+      header.id = 'ah_' + agent.id;
+      header.innerHTML =
+        '<span class="agent-icon">' + agent.icon + '</span>' +
+        '<div class="agent-header-text">' +
+          '<div class="agent-name">' + agent.name + '</div>' +
+          '<div class="agent-desc-mini">' + agent.description.slice(0, 50) + '</div>' +
+        '</div>' +
+        '<span class="agent-chevron">▸</span>';
+      header.onclick = function () { toggleAgent(agent.id); };
+
+      var taskList = document.createElement('div');
+      taskList.className = 'task-list';
+      taskList.id = 'tl_' + agent.id;
+
+      var inner = document.createElement('div');
+      inner.className = 'task-list-inner';
+
+      agent.tasks.forEach(function (task) {
+        var item = document.createElement('div');
+        item.className = 'task-item';
+        item.id = 'ti_' + agent.id + '_' + task.id;
+        item.innerHTML =
+          '<span class="task-dot" style="background:' + task.color + ';"></span>' +
+          '<span class="task-item-name">' + task.name + '</span>' +
+          '<span class="task-item-diff" style="color:' + (task.label_color || task.color) + ';background:' + (task.label_color || task.color) + '18;">' + task.label + '</span>';
+        item.onclick = function (e) {
+          e.stopPropagation();
+          selectTask(agent.id, task);
+        };
+        inner.appendChild(item);
+      });
+
+      taskList.appendChild(inner);
+      group.appendChild(header);
+      group.appendChild(taskList);
+      container.appendChild(group);
+    });
+
+    if (agentsData.length > 0) {
+      toggleAgent(agentsData[0].id);
+    }
+    document.getElementById('agentCountTag').textContent = agentsData.length + ' agent' + (agentsData.length !== 1 ? 's' : '');
+  });
+}
+
+function toggleAgent(agentId) {
+  agentsData.forEach(function (a) {
+    var h  = document.getElementById('ah_' + a.id);
+    var tl = document.getElementById('tl_' + a.id);
+    if (a.id === agentId) {
+      var isOpen = tl.classList.contains('open');
+      if (!isOpen) {
+        h.classList.add('active');
+        tl.classList.add('open');
+        selectedAgentId = agentId;
+      } else {
+        h.classList.remove('active');
+        tl.classList.remove('open');
+      }
+    } else {
+      h.classList.remove('active');
+      tl.classList.remove('open');
+    }
+  });
+}
+
+function selectTask(agentId, task) {
+  selectedAgentId  = agentId;
+  selectedTaskId   = task.id;
+  selectedTaskMeta = task;
+  maxSteps         = task.max_steps;
+
+  document.querySelectorAll('.task-item').forEach(function (ti) { ti.classList.remove('selected'); });
+  var el = document.getElementById('ti_' + agentId + '_' + task.id);
+  if (el) el.classList.add('selected');
+
+  var h  = document.getElementById('ah_' + agentId);
+  var tl = document.getElementById('tl_' + agentId);
+  if (h) h.classList.add('active');
+  if (tl) tl.classList.add('open');
+
+  document.getElementById('briefingText').textContent = TASK_DESCS[task.id] || task.name;
+  document.getElementById('stepCounterScore').textContent = '0 / ' + task.max_steps + ' steps';
+
+  var agent = agentsData.find(function (a) { return a.id === agentId; });
+  document.getElementById('footerInfo').textContent = (agent ? agent.name : agentId) + ' · ' + task.name;
+  tlog('t-sys', '// Selected: ' + (agent ? agent.name : agentId) + ' → ' + task.name + ' [' + task.label + ']');
+}
+
+function renderNodes(nodes) {
+  var grid = document.getElementById('nodeGrid');
+  grid.innerHTML = '';
+  var healthy = 0;
+  nodes.forEach(function (n) {
+    if (n.status === 'healthy') healthy++;
+    var dc = n.disk_usage > 85 ? '#ef4444' : n.disk_usage > 60 ? '#eab308' : '#10b981';
+    var rc = n.ram_usage > 85  ? '#ef4444' : n.ram_usage > 60  ? '#eab308' : '#10b981';
+    var c = document.createElement('div');
+    c.className = 'node-card ' + n.status + ' fade-in';
+    c.innerHTML =
+      '<div class="node-id">' + n.node_id + '</div>' +
+      '<div class="node-status ' + n.status + '">' + n.status.replace('_', ' ') + '</div>' +
+      '<div class="node-metrics">' +
+        '<span>Disk <b style="color:' + dc + '">' + n.disk_usage.toFixed(1) + '%</b></span>' +
+        '<span>RAM <b style="color:' + rc + '">' + n.ram_usage.toFixed(1) + '%</b></span>' +
+      '</div>' +
+      '<div class="metric-bar"><div class="metric-bar-fill" style="width:' + Math.min(n.disk_usage, 100) + '%;background:' + dc + '"></div></div>' +
+      '<div class="metric-bar" style="margin-top:2px"><div class="metric-bar-fill" style="width:' + Math.min(n.ram_usage, 100) + '%;background:' + rc + '"></div></div>';
+    grid.appendChild(c);
+  });
+  document.getElementById('nodeSub').textContent = nodes.length + ' nodes · ' + healthy + ' healthy · ' + (nodes.length - healthy) + ' degraded';
+}
+
+function updateScore(reward, health) {
+  totalReward += reward;
+  var el = document.getElementById('scoreReward');
+  el.textContent = (reward >= 0 ? '+' : '') + reward.toFixed(3);
+  el.style.color = reward > 0 ? '#10b981' : reward < 0 ? '#ef4444' : '#71717a';
+  document.getElementById('scoreHealth').textContent       = health.toFixed(2);
+  document.getElementById('healthTag').textContent         = 'Health: ' + (health * 100).toFixed(0) + '%';
+  document.getElementById('scoreTotal').textContent        = totalReward.toFixed(3);
+  document.getElementById('stepCounter').textContent       = 'Step ' + stepCount;
+  document.getElementById('stepCounterScore').textContent  = stepCount + ' / ' + maxSteps + ' steps';
+  rewardHistory.push(reward);
+  renderRewardBars();
+}
+
+function renderRewardBars() {
+  var c = document.getElementById('rewardBars');
+  var d = rewardHistory.slice(-12);
+  if (!d.length) return;
+  c.innerHTML = '';
+  var s = 0;
+  d.forEach(function (r) {
+    var b = document.createElement('div');
+    b.className = 'rbar ' + (r >= 0 ? 'pos' : 'neg');
+    b.style.height = Math.max(4, Math.round(Math.abs(r) * 100)) + '%';
+    c.appendChild(b); s += r;
+  });
+  document.getElementById('avgRwd').textContent = 'avg ' + (s / d.length).toFixed(3);
+}
+
+function renderObs(obs) {
+  var j = document.getElementById('jobsList');
+  if (!obs.active_jobs || !obs.active_jobs.length) {
+    j.innerHTML = '<span style="color:var(--green);">No active jobs ✓</span>';
+  } else {
+    j.innerHTML = obs.active_jobs.map(function (x) {
+      var cl = x.status === 'hanging' ? 'var(--red)' : 'var(--yellow)';
+      return '<div style="color:' + cl + ';margin-bottom:2px;">⚠ ' + x.job_id + ' <span style="color:var(--muted);">[' + x.status + ' · ' + x.ram_allocated + 'GB]</span></div>';
+    }).join('');
+  }
+  var a = document.getElementById('alertsList');
+  if (!obs.recent_alerts || !obs.recent_alerts.length) {
+    a.textContent = 'None';
+  } else {
+    a.innerHTML = obs.recent_alerts.map(function (x) {
+      var cl = /^(FATAL|CRITICAL)/.test(x) ? 'var(--red)' : /^(WARN)/.test(x) ? 'var(--yellow)' : /^(GOOD|SUCCESS)/.test(x) ? 'var(--green)' : 'var(--subtle)';
+      return '<div style="color:' + cl + ';margin-bottom:1px;">' + x + '</div>';
+    }).join('');
+  }
+}
+
+function doReset() {
+  if (!selectedAgentId || !selectedTaskId) {
+    tlog('t-warn', '[WARN] Select an agent and a task first.');
+    return;
+  }
+  rewardHistory = []; totalReward = 0; stepCount = 0; episodeDone = false;
+  document.getElementById('scoreReward').textContent = '+0.000';
+  document.getElementById('scoreReward').style.color = 'var(--muted)';
+  document.getElementById('scoreHealth').textContent = '—';
+  document.getElementById('scoreTotal').textContent  = '0.000';
+  document.getElementById('stepCounter').textContent = 'Step 0';
+  document.getElementById('stepCounterScore').textContent = '0 / ' + maxSteps + ' steps';
+  document.getElementById('avgRwd').textContent      = 'avg —';
+  document.getElementById('rewardBars').innerHTML    = '<div style="font-family:var(--mono);font-size:8px;color:var(--muted);margin:auto;">No steps yet</div>';
+  document.getElementById('doneTag').style.display   = 'none';
+  document.getElementById('healthTag').textContent   = 'Health: —';
+  document.getElementById('btnStep').disabled        = false;
+
+  tlog('t-reset', '═'.repeat(50));
+  tlog('t-reset', '  🔄 RESET — ' + selectedTaskId.toUpperCase().replace('_', ' '));
+  tlog('t-reset', '═'.repeat(50));
+
+  apiFetch('/reset', 'POST', { agent_id: selectedAgentId, task: selectedTaskId }).then(function (res) {
+    if (!res.ok) { tlog('t-err', '[ERROR] ' + res.err); return; }
+    var obs = res.data;
+    renderNodes(obs.nodes || []);
+    renderObs(obs);
+    document.getElementById('scoreHealth').textContent = obs.health_score.toFixed(2);
+    document.getElementById('healthTag').textContent   = 'Health: ' + (obs.health_score * 100).toFixed(0) + '%';
+    tlog('t-ok', '[READY] Health: ' + obs.health_score.toFixed(2) + ' | Jobs: ' +
+      (obs.active_jobs.map(function (j) { return j.job_id; }).join(', ') || 'none'));
+    tlog('t-sys', '// Click ▶ Agent Step to run the LLM.');
+  });
+}
+
+function doState() {
+  apiFetch('/state', 'GET', null).then(function (res) {
+    if (!res.ok) { tlog('t-err', '[ERROR] ' + res.err); return; }
+    var obs = res.data;
+    tlog('t-info', '--- 📊 STATE (step ' + stepCount + ') ---');
+    tlog('t-info', 'Health: ' + obs.health_score.toFixed(2) + ' | ' +
+      obs.nodes.map(function (n) { return n.node_id + '(' + n.status + ')'; }).join(', '));
+    renderNodes(obs.nodes);
+    renderObs(obs);
+  });
+}
+
+function doAgentStep() {
+  if (isRunning || episodeDone) return;
+  if (!selectedAgentId || !selectedTaskId) {
+    tlog('t-warn', '[WARN] Select agent + task and Reset first.');
+    return;
+  }
+  isRunning = true;
+  setStepUI(true);
+
+  apiFetch('/agent/step', 'POST', { agent_id: selectedAgentId, task: selectedTaskId }).then(function (res) {
+    isRunning = false;
+    setStepUI(false);
+    if (!res.ok) { tlog('t-err', '[API ERROR] ' + res.err); return; }
+
+    var d      = res.data;
+    stepCount  = d.step;
+    var reward = d.reward;
+    var done   = d.done;
+    var msg    = d.message || '';
+    var action = d.action || {};
+    var obs    = d.observation;
+
+    var actStr = (action.action_type || '?') + ' → ' + (action.target_id || '?');
+    var rCls   = reward > 0 ? 't-rpos' : reward < 0 ? 't-rneg' : 't-sys';
+    tlog('t-step', 'Step ' + String(stepCount).padStart(2, ' ') + ' | ' + actStr);
+    tlog(rCls,     '       | reward=' + (reward >= 0 ? '+' : '') + reward.toFixed(3) +
+                   ' | health=' + obs.health_score.toFixed(2) + ' | ' + msg);
+
+    updateScore(reward, obs.health_score);
+    renderNodes(obs.nodes);
+    renderObs(obs);
+
+    if (done) {
+      episodeDone = true;
+      var win = obs.health_score >= 1.0;
+      tlog('t-reset', '═'.repeat(50));
+      tlog(win ? 't-ok' : 't-err',
+        '  ' + (win ? '✅ SYSTEM NOMINAL — INCIDENT RESOLVED' : '❌ EPISODE ENDED — CLUSTER FAILED'));
+      tlog('t-reset', '═'.repeat(50));
+      document.getElementById('doneTag').style.display = 'inline';
+      document.getElementById('btnStep').disabled      = true;
+    }
+  });
+}
+
+function setStepUI(on) {
+  document.getElementById('stepSpinner').className = 'spinner' + (on ? ' on' : '');
+  document.getElementById('termSpinner').className = 'spinner' + (on ? ' on' : '');
+  document.getElementById('llmTag').style.display  = on ? 'inline' : 'none';
+  document.getElementById('stepBtnTxt').textContent = on ? 'Thinking...' : '▶ Agent Step';
+  document.getElementById('btnStep').disabled       = on;
+}
+
+function apiTest(path, method, body) {
+  var out = document.getElementById('apiOutput');
+  out.textContent = '// ' + method + ' ' + path + ' ...';
+  apiFetch(path, method, body || null).then(function (res) {
+    out.textContent = res.ok ? JSON.stringify(res.data, null, 2).slice(0, 800) : '// ERROR: ' + res.err;
+  });
+}
+function apiTestTasks() {
+  apiTest('/tasks?agent_id=' + (selectedAgentId || 'cluster_triage'), 'GET');
+}
+function apiTestReset() {
+  apiTest('/reset', 'POST', { agent_id: selectedAgentId || 'cluster_triage', task: selectedTaskId || 'easy' });
+}
+function apiTestAgentStep() {
+  apiTest('/agent/step', 'POST', { agent_id: selectedAgentId || 'cluster_triage', task: selectedTaskId || 'easy' });
+}
+
+function init() {
+  document.getElementById('apiBaseUrl').textContent = BASE;
+  apiFetch('/health', 'GET', null).then(function (res) {
+    var dot = document.getElementById('statusDot');
+    var txt = document.getElementById('statusText');
+    if (res.ok) {
+      dot.className = 'status-dot live';
+      txt.textContent = 'Online · ' + (res.data.env || 'cluster-triage');
+      document.getElementById('versionTag').textContent = 'v' + (res.data.version || '1.0.0');
+    } else {
+      dot.className = 'status-dot err';
+      txt.textContent = 'Offline';
+    }
+  });
+  loadAgents();
+}
+
+init();
+
+</script>
+</body>
+</html>
