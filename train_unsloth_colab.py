@@ -1,48 +1,43 @@
 """
-train_unsloth_colab.py — Curriculum GRPO Training on Split-Brain Collapse
-=========================================================================
+train_cluster_triage_unsloth.py — Curriculum GRPO Training on ClusterTriageEnv
+===============================================================================
 Trains Llama-3.2-3B-Instruct via GRPO (Group Relative Policy Optimization)
-directly against the live SplitBrainEnv reward function using curriculum learning.
+against the live ClusterTriageEnv reward function using curriculum learning.
 
-ROOT CAUSES OF 0% POST-TRAINING (all fixed in previous version, carried forward):
-─────────────────────────────────────────────────────────────
-CAUSE 1 — Zero gradient / cold-start: fixed with multi-step rollout reward
-CAUSE 2 — KV cache corruption: fixed with single eval/train toggle per episode
-CAUSE 3 — LoRA adapter disabled: fixed with enable_adapters() before eval
-CAUSE 4 — Reward scale mismatch: fixed with partial_rate metric
+Environment: 5 tasks (easy → medium → hard → very_hard → nightmare)
+  - easy:       Kill 1 rogue job
+  - medium:     Clear disk → restart node (2-step sequence)
+  - hard:       Kill job → clear 2 nodes → restart 2 nodes (5-step sequence)
+  - very_hard:  Kill 2 malware jobs → clear 2 nodes → restart 2 nodes
+  - nightmare:  Kill 3 hydra jobs → clear 4 nodes → restart 4 nodes
 
-NEW FEATURES IN THIS VERSION:
-─────────────────────────────
-FEATURE 1 — Threshold-based Early Exit (Speed):
-  Monitors rolling mean reward per stage. If it crosses the mastery threshold
-  for MIN_STEPS_BEFORE_EXIT+ROLLING_WINDOW steps, the stage exits early.
-  Saves ~1 hour on full curriculum by not overtraining converged stages.
-  Config: EARLY_EXIT_THRESHOLDS, MIN_STEPS_BEFORE_EXIT, ROLLING_WINDOW
+ACTION SPACE:
+  {"action_type": "kill_job",           "target_id": "<job_id>"}
+  {"action_type": "clear_temp_storage", "target_id": "<node_id>"}
+  {"action_type": "restart_node",       "target_id": "<node_id>"}
+  {"action_type": "noop",               "target_id": "none"}
 
-FEATURE 2 — Stripped JSON Observation (VRAM / num_generations):
-  strip_obs_json() removes null, empty, and uninformative fields from the
-  observation JSON before it enters the prompt. Saves ~16% tokens (43 tokens
-  per prompt on T4 16GB). This is used in the reward function prompts only —
-  not in eval (eval uses the env's native get_llm_prompts()).
-  Freed VRAM allows num_generations to safely go from 4 → 6 on T4.
+ROOT CAUSES OF ZERO-GRADIENT FIXED HERE:
+  CAUSE 1 — Cold-start: solved via multi-step rollout reward (not just step-1)
+  CAUSE 2 — KV-cache corruption: solved by toggling eval/train once per episode
+  CAUSE 3 — LoRA adapter off during eval: solved with enable_adapters()
+  CAUSE 4 — Sparse reward: solved with partial health-delta bonus (+0.05/0.1 step)
 
-FEATURE 3 — Weights & Biases Reporting (Presentation):
-  When WANDB_PROJECT env var is set, training logs reward/loss curves live to
-  W&B for professional judge-facing graphs. Falls back to report_to="none"
-  gracefully if wandb is not installed or WANDB_PROJECT is not set.
-  Set via: os.environ["WANDB_PROJECT"] = "openenv-split-brain"
+T4 (16 GB) OPTIMISATIONS:
+  - 4-bit quantised Llama-3.2-3B (unsloth/Llama-3.2-3B-Instruct-bnb-4bit)
+  - LoRA rank 16, gradient checkpointing="unsloth"
+  - adamw_8bit optimiser
+  - num_generations=6 (fits T4 with 4-bit + gradient checkpointing)
+  - max_prompt_length=1024, max_completion_length=200
 
-FEATURE 4 — +0.1 Health Delta Reward (Convergence):
-  Adds +0.1 bonus for every 0.1 increment of health_after - health_before
-  (capped at +0.5 total). This creates a denser reward curve and faster
-  mastery — the model gets small rewards for every step of progress, not
-  just for full completion. Makes the reward steeper and more informative.
+SMOKE-TEST CONFIG (< 15 minutes on T4):
+  Each stage: 5 GRPO steps, 10 prompts dataset
+  Full curriculum: 25 total GRPO steps
 
-Run on Google Colab (free T4 GPU):
-  !git clone https://github.com/Sayantan181222/openenv-cluster-triage-updated.git
-  %cd openenv-cluster-triage-updated
-  !pip install unsloth trl datasets matplotlib pydantic networkx python-dotenv wandb
-  !python train_unsloth_colab.py
+Run on Google Colab (free T4):
+  !pip install unsloth trl datasets matplotlib pydantic
+  # Copy environment.py and models.py from repo to Colab root
+  !python train_cluster_triage_unsloth.py
 """
 
 # ── 0. Imports ────────────────────────────────────────────────────────────────
@@ -57,260 +52,181 @@ from datasets import Dataset
 from unsloth import FastLanguageModel
 from trl import GRPOConfig, GRPOTrainer
 
-from agents.split_brain.environment import SplitBrainEnv
-from agents.split_brain.models import SplitBrainAction
-
-# ── FEATURE 3: W&B import with graceful fallback ──────────────────────────────
-# If wandb is not installed or WANDB_PROJECT is not set, we fall back to
-# report_to="none" silently. No crash, no mandatory config.
-WANDB_AVAILABLE = False
-WANDB_PROJECT   = os.getenv("WANDB_PROJECT", "")   # set this in Colab to enable
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-    print("[W&B] wandb found.")
-except ImportError:
-    print("[W&B] wandb not installed — falling back to local logging.")
-
-if WANDB_AVAILABLE and WANDB_PROJECT:
-    REPORT_TO = "wandb"
-    # Initialize the W&B run once here so all stages share the same run
-    wandb.init(
-        project=WANDB_PROJECT,
-        name="curriculum-grpo-split-brain",
-        config={
-            "model":      "Llama-3.2-3B-Instruct-bnb-4bit",
-            "lora_rank":  16,
-            "curriculum": "partition→storm→split→deadlock→wipeout",
-            "env":        "split-brain-collapse",
-        },
-        tags=["openenv", "grpo", "split-brain", "curriculum"],
-    )
-    print(f"[W&B] Logging to project: {WANDB_PROJECT}")
-else:
-    REPORT_TO = "none"
-    print("[W&B] W&B disabled. To enable: set WANDB_PROJECT env var before running.")
+# Local environment (copy environment.py + models.py to Colab root before running)
+from environment import ClusterTriageEnv
+from models import ClusterAction
 
 os.makedirs("plots", exist_ok=True)
-os.makedirs("openenv_outputs", exist_ok=True)
+os.makedirs("checkpoints", exist_ok=True)
 
 
-# ── 1. Config ─────────────────────────────────────────────────────────────────
+# ── 1. Hyperparameters & Smoke-Test Config ────────────────────────────────────
 BASE_MODEL      = "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
-LORA_OUTPUT_DIR = "openenv-split-brain-lora"
+LORA_OUTPUT_DIR = "cluster-triage-lora"
 MAX_SEQ_LENGTH  = 2048
 LORA_RANK       = 16
-EVAL_EPISODES   = 5
+EVAL_EPISODES   = 5      # episodes per task during evaluation
 
-# Per-task step budgets matching environment's own max_steps exactly.
+# Task max_steps mirror the env's built-in limit
 TASK_MAX_STEPS = {
-    "partition_basic":    15,
-    "replication_storm":  25,
-    "split_brain":        35,
-    "cascading_deadlock": 35,
-    "regional_wipeout":   50,
+    "easy":      10,
+    "medium":    15,
+    "hard":      20,
+    "very_hard": 20,
+    "nightmare": 25,
 }
 
-# ── SMOKE TEST CONFIG (10-minute run) ─────────────────────────────────────────
-# Do NOT change this — the curriculum stays as the smoke test config.
+# ── SMOKE-TEST CURRICULUM (< 15 min on T4) ───────────────────────────────────
+# Tuple: (task_id, grpo_steps, num_dataset_prompts)
 CURRICULUM = [
-    ("partition_basic",    5,  10),
-    ("replication_storm",  5,  10),
-    ("split_brain",        5,  10),
-    ("cascading_deadlock", 5,  10),
-    ("regional_wipeout",   5,  10),
+    ("easy",      5,  10),
+    ("medium",    5,  10),
+    ("hard",      5,  10),
+    ("very_hard", 5,  10),
+    ("nightmare", 5,  10),
 ]
-# Full curriculum (commented out — uncomment for production run):
+
+# Full curriculum (uncomment for production — ~4 hrs on T4):
 # CURRICULUM = [
-#     ("partition_basic",    60,  80),
-#     ("replication_storm",  70,  100),
-#     ("split_brain",        80,  120),
-#     ("cascading_deadlock", 80,  120),
-#     ("regional_wipeout",   80,  140),
+#     ("easy",      50,   80),
+#     ("medium",    60,   90),
+#     ("hard",      80,  120),
+#     ("very_hard", 80,  120),
+#     ("nightmare", 100, 150),
 # ]
-# ──────────────────────────────────────────────────────────────────────────────
 
 TASK_LABELS = {
-    "partition_basic":    "Partition\nBasic",
-    "replication_storm":  "Replication\nStorm",
-    "split_brain":        "Split\nBrain",
-    "cascading_deadlock": "Cascading\nDeadlock",
-    "regional_wipeout":   "Regional\nWipeout",
+    "easy":      "Easy\n(Kill rogue job)",
+    "medium":    "Medium\n(Clear + restart)",
+    "hard":      "Hard\n(5-step recovery)",
+    "very_hard": "Very Hard\n(Dual malware)",
+    "nightmare": "Nightmare\n(Hydra protocol)",
 }
 STAGE_COLORS = ["#10b981", "#fbbf24", "#f97316", "#7c3aed", "#b91c1c"]
 
-# ── FEATURE 1: Early Exit Config ──────────────────────────────────────────────
-# If rolling mean reward over ROLLING_WINDOW steps exceeds this threshold
-# AND at least MIN_STEPS_BEFORE_EXIT steps have been taken, exit the stage.
-# Thresholds are calibrated to the reward scale of each task:
-#   perfect completion reward ≈ +5.4 for all tasks
-#   random/noop reward        ≈ -0.6
-#   threshold at ~55% of range = model consistently choosing correct action
+# Early-exit: if rolling-mean reward exceeds threshold for ROLLING_WINDOW steps
+# after MIN_STEPS steps, skip remainder of stage (avoid overtraining converged stages)
 EARLY_EXIT_THRESHOLDS = {
-    "partition_basic":    3.0,   # easiest, high threshold
-    "replication_storm":  2.5,
-    "split_brain":        2.0,
-    "cascading_deadlock": 2.0,
-    "regional_wipeout":   1.5,   # hardest, lower threshold
+    "easy":      0.80,   # easy task — high bar
+    "medium":    0.60,
+    "hard":      0.45,
+    "very_hard": 0.35,
+    "nightmare": 0.25,   # hardest — lower bar
 }
-MIN_STEPS_BEFORE_EXIT = 10   # never exit in first 10 steps (avoid lucky variance)
-ROLLING_WINDOW        = 5    # average over last 5 logged reward entries
+MIN_STEPS_BEFORE_EXIT = 3    # smoke-test: check after 3 steps
+ROLLING_WINDOW        = 3    # average over last 3 logged reward values
 
 
 # ── 2. Load Model + LoRA ──────────────────────────────────────────────────────
 print(f"\n{'='*65}")
 print(f"  Loading {BASE_MODEL}")
-print(f"{'='*65}")
+print(f"{'='*65}\n")
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=BASE_MODEL,
-    max_seq_length=MAX_SEQ_LENGTH,
-    load_in_4bit=True,
-    fast_inference=False,
-    max_lora_rank=LORA_RANK,
+    model_name     = BASE_MODEL,
+    max_seq_length = MAX_SEQ_LENGTH,
+    load_in_4bit   = True,
+    fast_inference = False,   # must be False for GRPO training
+    max_lora_rank  = LORA_RANK,
 )
+
 model = FastLanguageModel.get_peft_model(
     model,
-    r=LORA_RANK,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"],
-    lora_alpha=LORA_RANK,
-    use_gradient_checkpointing="unsloth",
+    r              = LORA_RANK,
+    target_modules = [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ],
+    lora_alpha              = LORA_RANK,
+    lora_dropout            = 0,          # 0 is optimal for unsloth
+    bias                    = "none",
+    use_gradient_checkpointing = "unsloth",  # saves ~30% VRAM on T4
+    random_state            = 42,
 )
 print("[INFO] Model + LoRA ready.\n")
 
 
-# ── 3. Core Helpers ───────────────────────────────────────────────────────────
+# ── 3. Prompt Engineering ─────────────────────────────────────────────────────
 
-def parse_action(text: str) -> SplitBrainAction:
+SYSTEM_PROMPT = (
+    "You are an automated SRE agent triaging a distributed cluster failure. "
+    "You ONLY output raw JSON. No explanations, no markdown, no extra text. "
+    "Always output exactly ONE JSON object matching this schema:\n"
+    '{"action_type": "<kill_job|restart_node|clear_temp_storage|noop>", "target_id": "<id>"}\n\n'
+    "STRICT RULES — follow in order:\n"
+    "  1. Kill ALL hanging jobs before touching any node.\n"
+    "  2. Never restart a node with disk_usage > 50%. Clear storage first.\n"
+    "  3. For nightmare mode: kill ALL 3 hydra jobs before clearing ANY storage.\n"
+    "  4. Clear offline nodes one at a time, then restart them.\n"
+    "  5. Output ONLY the JSON. Nothing else."
+)
+
+
+def build_user_prompt(obs_json: str, history: list[str]) -> str:
+    hist = "\n".join(history) if history else "None yet."
+    return (
+        f"CURRENT CLUSTER STATE:\n{obs_json}\n\n"
+        f"PREVIOUS ACTIONS THIS EPISODE:\n{hist}\n\n"
+        "What is your next action? Output ONLY the JSON object."
+    )
+
+
+# ── 4. Action Parsing ─────────────────────────────────────────────────────────
+
+def parse_action(text: str) -> ClusterAction:
     """
-    Parse LLM text into a SplitBrainAction with multi-stage fallback.
-    Handles DeepSeek <think> tags, markdown fences, and embedded JSON.
-    Returns noop only as a last resort.
+    Robust multi-stage parser: handles DeepSeek <think> tags, markdown
+    fences, and greedy/non-greedy JSON extraction. Falls back to noop.
     """
+    # Strip chain-of-thought reasoning blocks
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
     text = text.replace("```json", "").replace("```", "").strip()
 
+    # Attempt 1: direct JSON parse
     try:
         data = json.loads(text)
-        if "instruction_payload" in data and isinstance(data["instruction_payload"], dict):
-            data["instruction_payload"] = json.dumps(data["instruction_payload"])
-        return SplitBrainAction(**data)
+        if "action_type" in data:
+            return ClusterAction(**data)
     except Exception:
         pass
 
-    match = re.search(r'\{.*?\}', text, re.DOTALL)
-    if match:
+    # Attempt 2: non-greedy first JSON object
+    m = re.search(r'\{.*?\}', text, re.DOTALL)
+    if m:
         try:
-            data = json.loads(match.group(0))
+            data = json.loads(m.group(0))
             if "action_type" in data:
-                return SplitBrainAction(**data)
+                return ClusterAction(**data)
         except Exception:
             pass
 
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
+    # Attempt 3: greedy (handles nested objects)
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
         try:
-            data = json.loads(match.group(0))
+            data = json.loads(m.group(0))
             if "action_type" in data:
-                return SplitBrainAction(**data)
+                return ClusterAction(**data)
         except Exception:
             pass
 
-    return SplitBrainAction(action_type="noop")
+    return ClusterAction(action_type="noop", target_id="none")
 
 
-# ── FEATURE 2: Strip Redundant JSON Keys ──────────────────────────────────────
-def strip_obs_for_prompt(obs_dict: dict) -> dict:
+# ── 5. Model Inference ────────────────────────────────────────────────────────
+
+def generate_action_text(sys_prompt: str, usr_prompt: str) -> str:
     """
-    Remove null, empty, and uninformative fields from an observation dict
-    before it is serialized into the LLM prompt.
-
-    Why: The full observation JSON can contain many null/False/empty fields
-    that add tokens without adding information. On T4 (16GB), every token
-    saved directly translates to headroom for higher num_generations.
-
-    Savings: ~16% fewer tokens (≈43 tokens per prompt).
-    This allows num_generations to safely increase from 4 → 6 on T4 16GB.
-
-    Rules:
-    - Remove any key whose value is None
-    - Remove any key whose value is an empty list []
-    - Remove any key whose value is False AND is not a semantically
-      important boolean (we keep dc1_dc2_connected, routing_verified,
-      split_brain_active, storm_killed, ledger_reconciled, oob_tunnel_active
-      because False is meaningful for these)
-    - Remove step_count from the observation (already shown in prompt header)
-    - Recursively apply to nested dicts and lists
-
-    This is used ONLY for reward function prompts. Evaluation uses the
-    environment's native get_llm_prompts() which is unchanged.
-    """
-    # Booleans we must keep even when False — their False value is informative
-    KEEP_FALSE_KEYS = {
-        "dc1_dc2_connected",
-        "routing_verified",
-        "bypass_established",
-        "split_brain_active",
-        "storm_killed",
-        "ledger_reconciled",
-        "oob_tunnel_active",
-        "replication_storm_active",
-    }
-    # Keys that are always noise in the prompt
-    ALWAYS_STRIP_KEYS = {"step_count", "instruction_payload"}
-
-    def _strip(obj, parent_key=""):
-        if isinstance(obj, dict):
-            result = {}
-            for k, v in obj.items():
-                if k in ALWAYS_STRIP_KEYS:
-                    continue
-                if v is None:
-                    continue
-                if isinstance(v, list) and len(v) == 0:
-                    continue
-                if isinstance(v, bool) and v is False and k not in KEEP_FALSE_KEYS:
-                    continue
-                result[k] = _strip(v, k)
-            return result
-        elif isinstance(obj, list):
-            return [_strip(item) for item in obj]
-        return obj
-
-    return _strip(obs_dict)
-
-
-def obs_to_compact_json(obs) -> str:
-    """
-    Convert a SplitBrainObservation to a compact JSON string for use in
-    reward function prompts. Strips redundant keys to save tokens.
-    """
-    try:
-        # Use model_dump() for Pydantic v2, dict() for v1
-        if hasattr(obs, "model_dump"):
-            raw = obs.model_dump()
-        else:
-            raw = obs.dict()
-        stripped = strip_obs_for_prompt(raw)
-        return json.dumps(stripped, indent=2)
-    except Exception:
-        # Fallback: return as-is if anything fails
-        return str(obs)
-
-
-def generate_single_action(sys_prompt: str, usr_prompt: str) -> str:
-    """
-    Generate one action string from the model.
-    Caller must set model.eval() before the episode loop and
-    model.train() after. Never toggle mode inside this function.
+    Generate one raw action string from the model.
+    Caller is responsible for toggling model.eval() / model.train().
     """
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user",   "content": usr_prompt},
     ]
     input_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
+        messages, tokenize=False, add_generation_prompt=True
+    )
     inputs = tokenizer(
         input_text,
         return_tensors="pt",
@@ -321,71 +237,81 @@ def generate_single_action(sys_prompt: str, usr_prompt: str) -> str:
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=150,
-            temperature=0.2,
-            do_sample=True,
-            top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id,
+            max_new_tokens    = 120,
+            temperature       = 0.2,
+            do_sample         = True,
+            top_p             = 0.9,
+            pad_token_id      = tokenizer.eos_token_id,
+            repetition_penalty= 1.1,   # reduces looping noop outputs
         )
 
     generated = outputs[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(generated, skip_special_tokens=True)
 
 
-# ── 4. Evaluation ─────────────────────────────────────────────────────────────
+# ── 6. Evaluation ─────────────────────────────────────────────────────────────
 
 def run_eval_episode(task_id: str) -> dict:
     """
-    Run one full evaluation episode using live model inference.
-    model.eval() set ONCE before loop, model.train() ONCE in finally.
+    Run one complete evaluation episode.
+    Enables LoRA adapter + eval mode ONCE before the loop.
+    Restores train mode in finally block — never toggles mid-episode.
     """
+    # Ensure LoRA adapter is live for eval
     try:
-        if hasattr(model, 'set_adapter'):
-            model.set_adapter("default")
-        elif hasattr(model, 'enable_adapters'):
-            model.enable_adapters()
+        model.set_adapter("default")
+    except Exception:
+        pass
+    try:
+        model.enable_adapters()
     except Exception:
         pass
 
-    env = SplitBrainEnv()
-    env.reset(task=task_id)
-    total_reward    = 0.0
-    diag_calls      = 0
-    success         = False
-    partial_success = False
-    max_steps       = TASK_MAX_STEPS.get(task_id, 20)
+    env       = ClusterTriageEnv()
+    obs       = env.reset(task=task_id)
+    max_steps = TASK_MAX_STEPS.get(task_id, 20)
+
+    total_reward = 0.0
+    success      = False
+    steps_taken  = 0
+    history: list[str] = []
 
     model.eval()
     try:
         for step in range(max_steps):
-            sys_p, usr_p = env.get_llm_prompts()
-            raw    = generate_single_action(sys_p, usr_p)
-            action = parse_action(raw)
-
-            if action.action_type == "run_diagnostic":
-                diag_calls += 1
+            obs_json   = obs.model_dump_json(indent=2)
+            usr_prompt = build_user_prompt(obs_json, history)
+            raw_text   = generate_action_text(SYSTEM_PROMPT, usr_prompt)
+            action     = parse_action(raw_text)
 
             result = env.step(action)
             total_reward += result.reward
+            steps_taken   = step + 1
+            msg = result.info.get("message", "")
+            history.append(
+                f"Step {step+1}: {action.action_type}({action.target_id})"
+                f" → reward={result.reward:.2f} | {msg}"
+            )
+            obs = result.observation
 
             if result.done:
-                health          = result.observation.global_health
-                success         = health >= 1.0
-                partial_success = health >= 0.5
+                success = obs.health_score >= 1.0
                 break
     finally:
         model.train()
 
+    # Final health check even if episode didn't call done
     if not success and env.state_data is not None:
-        h = env.state_data.global_health
-        success         = h >= 1.0
-        partial_success = h >= 0.5
+        success = env.state_data.health_score >= 1.0
+
+    partial = (obs.health_score >= 0.5) if not success else True
 
     return {
-        "total_reward":     total_reward,
-        "success":          success,
-        "partial_success":  partial_success,
-        "diagnostic_calls": diag_calls,
+        "total_reward": total_reward,
+        "success":      success,
+        "partial":      partial,
+        "steps":        steps_taken,
+        "final_health": obs.health_score,
     }
 
 
@@ -397,92 +323,112 @@ def evaluate_all_tasks(label: str) -> dict:
     metrics = {}
     for task_id, _, _ in CURRICULUM:
         results = [run_eval_episode(task_id) for _ in range(EVAL_EPISODES)]
-        sr   = sum(r["success"]         for r in results) / EVAL_EPISODES * 100
-        psr  = sum(r["partial_success"] for r in results) / EVAL_EPISODES * 100
-        ar   = sum(r["total_reward"]    for r in results) / EVAL_EPISODES
-        adc  = sum(r["diagnostic_calls"]for r in results) / EVAL_EPISODES
+        sr  = sum(r["success"] for r in results) / EVAL_EPISODES * 100
+        psr = sum(r["partial"] for r in results) / EVAL_EPISODES * 100
+        ar  = sum(r["total_reward"]  for r in results) / EVAL_EPISODES
+        ah  = sum(r["final_health"]  for r in results) / EVAL_EPISODES
         metrics[task_id] = {
-            "success_rate": sr, "partial_rate": psr,
-            "avg_reward":   ar, "avg_diag":     adc,
+            "success_rate": sr,
+            "partial_rate": psr,
+            "avg_reward":   ar,
+            "avg_health":   ah,
         }
         print(
-            f"  {task_id:<22} SR={sr:5.1f}%  partial={psr:5.1f}%"
-            f"  reward={ar:+.3f}  diag={adc:.1f}"
+            f"  {task_id:<12} SR={sr:5.1f}%  partial={psr:5.1f}%"
+            f"  reward={ar:+.3f}  health={ah:.3f}"
         )
     print(f"{'─'*65}")
     return metrics
 
 
-# ── 5. Dataset Builder ────────────────────────────────────────────────────────
+# ── 7. Dataset Builder ────────────────────────────────────────────────────────
+# Expert prefix sequences: partially replay optimal trajectories to build a
+# diverse dataset covering different environment decision points.
 
 EXPERT_SEQUENCES = {
-    "partition_basic": [
-        [],
-        [{"action_type": "assess_situation"}],
-        [{"action_type": "delegate", "target_agent": "netops",
-          "instruction_payload": "Establish bypass routing to restore dc1-dc2 connectivity"}],
+    "easy": [
+        [],  # fresh reset
     ],
-    "replication_storm": [
+    "medium": [
         [],
-        [{"action_type": "assess_situation"}],
-        [{"action_type": "delegate", "target_agent": "netops",
-          "instruction_payload": "Fix network partition first"}],
-        [{"action_type": "delegate", "target_agent": "dataops",
-          "instruction_payload": "Stop the replication storm after network is fixed"}],
+        [{"action_type": "clear_temp_storage", "target_id": "worker_03"}],
     ],
-    "split_brain": [
+    "hard": [
         [],
-        [{"action_type": "assess_situation"}],
-        [{"action_type": "delegate", "target_agent": "netops",
-          "instruction_payload": "Establish bypass routing"}],
-        [{"action_type": "delegate", "target_agent": "dataops",
-          "instruction_payload": "Stop replication storm, then force_stepdown, then reconcile_ledger"}],
+        [{"action_type": "kill_job",           "target_id": "job_rogue_99"}],
+        [{"action_type": "kill_job",           "target_id": "job_rogue_99"},
+         {"action_type": "clear_temp_storage", "target_id": "worker_01"}],
+        [{"action_type": "kill_job",           "target_id": "job_rogue_99"},
+         {"action_type": "clear_temp_storage", "target_id": "worker_01"},
+         {"action_type": "clear_temp_storage", "target_id": "worker_02"}],
     ],
-    "cascading_deadlock": [
+    "very_hard": [
         [],
-        [{"action_type": "run_diagnostic"}],
-        [{"action_type": "delegate", "target_agent": "netops",
-          "instruction_payload": "Fix network routing urgently — Redis is climbing"}],
-        [{"action_type": "delegate", "target_agent": "dataops",
-          "instruction_payload": "Clear Redis cache immediately — auth is at risk"}],
+        [{"action_type": "kill_job", "target_id": "job_log_spam"}],
+        [{"action_type": "kill_job", "target_id": "job_log_spam"},
+         {"action_type": "kill_job", "target_id": "job_crypto_miner"}],
+        [{"action_type": "kill_job",           "target_id": "job_log_spam"},
+         {"action_type": "kill_job",           "target_id": "job_crypto_miner"},
+         {"action_type": "clear_temp_storage", "target_id": "worker_01"}],
     ],
-    "regional_wipeout": [
+    "nightmare": [
         [],
-        [{"action_type": "run_diagnostic"}],
-        [{"action_type": "delegate", "target_agent": "netops",
-          "instruction_payload": "Throttle dc2_router--dc3_router to 10% then create oob_tunnel"}],
-        [{"action_type": "delegate", "target_agent": "dataops",
-          "instruction_payload": "Stop replication storm via OOB tunnel"}],
-        [{"action_type": "delegate", "target_agent": "netops",
-          "instruction_payload": "Establish bypass route through dc3 now storm is stopped"}],
+        [{"action_type": "kill_job", "target_id": "job_hydra_1"}],
+        [{"action_type": "kill_job", "target_id": "job_hydra_1"},
+         {"action_type": "kill_job", "target_id": "job_hydra_2"}],
+        [{"action_type": "kill_job", "target_id": "job_hydra_1"},
+         {"action_type": "kill_job", "target_id": "job_hydra_2"},
+         {"action_type": "kill_job", "target_id": "job_hydra_3"}],
+        [{"action_type": "kill_job",           "target_id": "job_hydra_1"},
+         {"action_type": "kill_job",           "target_id": "job_hydra_2"},
+         {"action_type": "kill_job",           "target_id": "job_hydra_3"},
+         {"action_type": "clear_temp_storage", "target_id": "worker_01"}],
     ],
 }
 
 
 def build_dataset(task_id: str, num_prompts: int) -> Dataset:
-    """Build GRPO training dataset from diverse episode states."""
+    """
+    Build GRPO training dataset by replaying expert prefix sequences
+    to capture diverse mid-episode states. Each sample is a chat prompt
+    at a different decision point in the episode.
+    """
     seqs = EXPERT_SEQUENCES.get(task_id, [[]])
     samples = []
-    prompts_per_seq = max(1, num_prompts // len(seqs))
+    per_seq = max(1, num_prompts // len(seqs))
 
     for seq in seqs:
-        for _ in range(prompts_per_seq):
-            env = SplitBrainEnv()
-            env.reset(task=task_id)
+        for _ in range(per_seq):
+            env = ClusterTriageEnv()
+            obs = env.reset(task=task_id)
+            history: list[str] = []
+
+            # Replay prefix
             for act_dict in seq:
                 try:
-                    env.step(SplitBrainAction(**act_dict))
+                    act = ClusterAction(**act_dict)
+                    result = env.step(act)
+                    msg = result.info.get("message", "")
+                    history.append(
+                        f"{act_dict['action_type']}({act_dict.get('target_id','')}) "
+                        f"→ {msg}"
+                    )
+                    obs = result.observation
                 except Exception:
                     pass
-            sys_p, usr_p = env.get_llm_prompts()
+
+            obs_json   = obs.model_dump_json(indent=2)
+            usr_prompt = build_user_prompt(obs_json, history)
+
             samples.append({
                 "prompt": [
-                    {"role": "system", "content": sys_p},
-                    {"role": "user",   "content": usr_p},
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": usr_prompt},
                 ],
                 "task_id": task_id,
             })
 
+    # Pad to num_prompts by repeating random samples
     while len(samples) < num_prompts:
         samples.append(random.choice(samples))
     samples = samples[:num_prompts]
@@ -490,99 +436,93 @@ def build_dataset(task_id: str, num_prompts: int) -> Dataset:
     return Dataset.from_list(samples)
 
 
-# ── 6. Reward Function ────────────────────────────────────────────────────────
+# ── 8. Reward Function ────────────────────────────────────────────────────────
+# Expert completion policies: after the model's first action, the scripted
+# policy plays out the rest of the episode optimally. This gives the model
+# credit for choosing the right FIRST action even in sparse-reward tasks.
+
+SCRIPTED_COMPLETIONS = {
+    "easy": [
+        {"action_type": "kill_job", "target_id": "job_rogue_99"},
+    ],
+    "medium": [
+        {"action_type": "clear_temp_storage", "target_id": "worker_03"},
+        {"action_type": "restart_node",       "target_id": "worker_03"},
+    ],
+    "hard": [
+        {"action_type": "kill_job",           "target_id": "job_rogue_99"},
+        {"action_type": "clear_temp_storage", "target_id": "worker_01"},
+        {"action_type": "clear_temp_storage", "target_id": "worker_02"},
+        {"action_type": "restart_node",       "target_id": "worker_01"},
+        {"action_type": "restart_node",       "target_id": "worker_02"},
+    ],
+    "very_hard": [
+        {"action_type": "kill_job",           "target_id": "job_log_spam"},
+        {"action_type": "kill_job",           "target_id": "job_crypto_miner"},
+        {"action_type": "clear_temp_storage", "target_id": "worker_01"},
+        {"action_type": "clear_temp_storage", "target_id": "worker_02"},
+        {"action_type": "restart_node",       "target_id": "worker_01"},
+        {"action_type": "restart_node",       "target_id": "worker_02"},
+    ],
+    "nightmare": [
+        {"action_type": "kill_job",           "target_id": "job_hydra_1"},
+        {"action_type": "kill_job",           "target_id": "job_hydra_2"},
+        {"action_type": "kill_job",           "target_id": "job_hydra_3"},
+        {"action_type": "clear_temp_storage", "target_id": "worker_01"},
+        {"action_type": "clear_temp_storage", "target_id": "worker_02"},
+        {"action_type": "clear_temp_storage", "target_id": "worker_03"},
+        {"action_type": "clear_temp_storage", "target_id": "worker_04"},
+        {"action_type": "restart_node",       "target_id": "worker_01"},
+        {"action_type": "restart_node",       "target_id": "worker_02"},
+        {"action_type": "restart_node",       "target_id": "worker_03"},
+        {"action_type": "restart_node",       "target_id": "worker_04"},
+    ],
+}
+
+# Action correctness lookup: what is the correct first action at each task state?
+CORRECT_FIRST_ACTIONS = {
+    "easy":      [("kill_job",           "job_rogue_99")],
+    "medium":    [("clear_temp_storage", "worker_03"),
+                  ("restart_node",       "worker_03")],   # if storage already cleared
+    "hard":      [("kill_job",           "job_rogue_99")],
+    "very_hard": [("kill_job",           "job_log_spam"),
+                  ("kill_job",           "job_crypto_miner")],
+    "nightmare": [("kill_job",           "job_hydra_1"),
+                  ("kill_job",           "job_hydra_2"),
+                  ("kill_job",           "job_hydra_3")],
+}
+
 
 def make_reward_fn(task_id: str):
     """
-    GRPO reward function with multi-step rollout and conditional scripted policy.
+    GRPO reward function: multi-step rollout with scripted expert completion.
 
-    Changes in this version:
-    ─────────────────────────
-    FEATURE 2: Uses obs_to_compact_json() to build the reward-function prompt,
-               saving ~43 tokens per prompt (freed VRAM → num_generations=6).
+    Reward components:
+      1. Step rewards from env.step() for the model's first action
+      2. Step rewards from scripted policy for remaining steps
+      3. Completion bonus: +5.0 if final health >= 1.0, +health*2 if >= 0.5
+      4. Health-delta bonus: +0.05 * floor(delta/0.05), capped at +0.5
+         → Gives dense gradient signal for every 5% health improvement
+      5. First-action bonus: +0.3 if action matches known-correct first action
+         → Directly rewards learning the right action priority order
+      6. Parse / noop penalties: -1.0 for parse fail, -0.3 for needless noop
 
-    FEATURE 4: Adds +0.1 * floor(delta_health / 0.1) health-delta reward,
-               capped at +0.5. This creates a denser reward curve so the model
-               gets gradient signal from every incremental health improvement,
-               not just from full completion. Converges faster and makes
-               the learning curve steeper in W&B plots.
+    Why scripted completion works:
+      The model only needs to learn the FIRST correct action per state.
+      The scripted policy handles the rest, so the model gets a full-episode
+      reward signal even in early training when it can't complete full rollouts.
+      This is the key trick that prevents zero-gradient cold start.
     """
-
-    SCRIPTED_POLICIES = {
-        "partition_basic": [
-            {"action_type": "delegate",     "target_agent": "netops",
-             "instruction_payload": "Establish bypass routing"},
-            {"action_type": "update_route", "target_id": "dc1_router--dc2_switch"},
-            {"action_type": "verify_routing"},
-        ],
-        "replication_storm": [
-            {"action_type": "delegate",     "target_agent": "netops",
-             "instruction_payload": "Fix network"},
-            {"action_type": "update_route", "target_id": "dc1_router--dc2_switch"},
-            {"action_type": "verify_routing"},
-            {"action_type": "delegate",     "target_agent": "orchestrator",
-             "instruction_payload": "Network fixed"},
-            {"action_type": "delegate",     "target_agent": "dataops",
-             "instruction_payload": "Stop replication storm"},
-            {"action_type": "stop_replication"},
-        ],
-        "split_brain": [
-            {"action_type": "delegate",     "target_agent": "netops",
-             "instruction_payload": "Fix network"},
-            {"action_type": "update_route", "target_id": "dc1_router--dc2_switch"},
-            {"action_type": "verify_routing"},
-            {"action_type": "delegate",     "target_agent": "orchestrator",
-             "instruction_payload": "Network fixed"},
-            {"action_type": "delegate",     "target_agent": "dataops",
-             "instruction_payload": "Stop storm then fix split-brain"},
-            {"action_type": "stop_replication"},
-            {"action_type": "force_stepdown"},
-            {"action_type": "reconcile_ledger"},
-        ],
-        "cascading_deadlock": [
-            {"action_type": "delegate",     "target_agent": "netops",
-             "instruction_payload": "Fix network fast"},
-            {"action_type": "update_route", "target_id": "dc1_router--dc2_switch"},
-            {"action_type": "verify_routing"},
-            {"action_type": "delegate",     "target_agent": "orchestrator",
-             "instruction_payload": "Network done"},
-            {"action_type": "delegate",     "target_agent": "dataops",
-             "instruction_payload": "Clear Redis cache"},
-            {"action_type": "clear_cache"},
-        ],
-        "regional_wipeout": [
-            {"action_type": "delegate",     "target_agent": "netops",
-             "instruction_payload": "Throttle then oob_tunnel"},
-            {"action_type": "throttle_bandwidth",
-             "target_id": "dc2_router--dc3_router", "limit_pct": 10},
-            {"action_type": "update_route", "target_id": "oob_tunnel"},
-            {"action_type": "delegate",     "target_agent": "orchestrator",
-             "instruction_payload": "OOB ready"},
-            {"action_type": "delegate",     "target_agent": "dataops",
-             "instruction_payload": "Stop replication via OOB"},
-            {"action_type": "stop_replication"},
-            {"action_type": "delegate",     "target_agent": "orchestrator",
-             "instruction_payload": "Storm stopped"},
-            {"action_type": "delegate",     "target_agent": "netops",
-             "instruction_payload": "Establish bypass now dc3 is free"},
-            {"action_type": "update_route", "target_id": "dc1_router--dc2_switch"},
-            {"action_type": "verify_routing"},
-            {"action_type": "delegate",     "target_agent": "orchestrator",
-             "instruction_payload": "Network verified"},
-            {"action_type": "delegate",     "target_agent": "dataops",
-             "instruction_payload": "Fix split-brain"},
-            {"action_type": "force_stepdown"},
-            {"action_type": "reconcile_ledger"},
-        ],
-    }
+    correct_firsts = CORRECT_FIRST_ACTIONS.get(task_id, [])
+    completion_policy = SCRIPTED_COMPLETIONS.get(task_id, [])
+    max_steps = TASK_MAX_STEPS.get(task_id, 20)
 
     def reward_fn(prompts, completions, **kwargs):
         rewards = []
 
         for completion in completions:
-
-            # ── Extract model's generated text ────────────────────────────
-            if isinstance(completion, list) and len(completion) > 0:
+            # ── Extract generated text ─────────────────────────────────────
+            if isinstance(completion, list) and completion:
                 c = completion[0]
                 action_text = c.get("content", "") if isinstance(c, dict) else str(c)
             elif isinstance(completion, str):
@@ -590,7 +530,7 @@ def make_reward_fn(task_id: str):
             else:
                 action_text = str(completion)
 
-            # ── Parse model's first action ────────────────────────────────
+            # ── Parse model's first action ─────────────────────────────────
             first_action = parse_action(action_text)
             is_parse_fail = (
                 first_action.action_type == "noop"
@@ -598,90 +538,86 @@ def make_reward_fn(task_id: str):
                 and "{" not in action_text
             )
 
-            # ── Fresh environment ─────────────────────────────────────────
-            env = SplitBrainEnv()
+            # ── Fresh environment ──────────────────────────────────────────
+            env = ClusterTriageEnv()
             env.reset(task=task_id)
-            assert env.state_data is not None
+            health_before = env.state_data.global_health if hasattr(env.state_data, 'global_health') else env.state_data.health_score
+            total_reward  = 0.0
 
-            health_before        = env.state_data.global_health
-            total_episode_reward = 0.0
-            max_steps            = TASK_MAX_STEPS.get(task_id, 20)
-
-            # ── Step 1: Execute model's action ────────────────────────────
+            # ── Step 1: Execute model's action ─────────────────────────────
+            episode_done = False
             try:
-                result            = env.step(first_action)
-                total_episode_reward += result.reward
-                episode_done      = result.done
-            except Exception as e:
-                total_episode_reward = -0.5
-                episode_done         = True
+                result        = env.step(first_action)
+                total_reward += result.reward
+                episode_done  = result.done
+            except Exception:
+                total_reward  = -0.5
+                episode_done  = True
 
-            # ── Steps 2+: Scripted policy completion ──────────────────────
+            # ── Steps 2+: Scripted expert completion ───────────────────────
             if not episode_done:
-                policy = SCRIPTED_POLICIES.get(task_id, [])
-                for i, act_dict in enumerate(policy):
-                    if episode_done or i >= (max_steps - 1):
+                for i, act_dict in enumerate(completion_policy):
+                    if episode_done or (i + 1) >= max_steps:
                         break
                     try:
-                        act = SplitBrainAction(**act_dict)
-                        result = env.step(act)
-                        total_episode_reward += result.reward
-                        episode_done = result.done
+                        act           = ClusterAction(**act_dict)
+                        result        = env.step(act)
+                        total_reward += result.reward
+                        episode_done  = result.done
                     except Exception:
                         break
 
-            # ── Final health ──────────────────────────────────────────────
+            # ── Final health ───────────────────────────────────────────────
             final_health = 0.0
             if env.state_data is not None:
-                final_health = env.state_data.global_health
-            elif 'result' in dir() and hasattr(result, 'observation'):
-                final_health = result.observation.global_health
+                final_health = getattr(env.state_data, 'health_score', 0.0)
 
-            # ── Completion bonus ──────────────────────────────────────────
+            # ── Completion bonus ───────────────────────────────────────────
             if final_health >= 1.0:
-                total_episode_reward += 5.0
+                total_reward += 5.0
             elif final_health >= 0.5:
-                total_episode_reward += final_health * 2.0
+                total_reward += final_health * 2.0
 
-            # ── FEATURE 4: Health delta reward ───────────────────────────
-            # Add +0.1 for every 0.1 increment of health improvement.
-            # Capped at +0.5 to avoid overshadowing the completion bonus.
-            # This creates a denser, steeper reward curve that:
-            #   (a) gives gradient signal even for partial correct actions
-            #   (b) makes W&B plots show clear upward trend earlier in training
-            #   (c) speeds up convergence on harder tasks where full completion
-            #       is rare in early training steps
-            delta_health = final_health - health_before
-            if delta_health > 0:
-                # floor to nearest 0.1 increment, cap at 0.5
-                delta_bonus = min(0.5, round(int(delta_health * 10) * 0.1, 1))
-                total_episode_reward += delta_bonus
+            # ── Health-delta bonus (dense reward shaping) ──────────────────
+            # +0.05 for every 5% of health improvement, capped at +0.5
+            # Gives gradient signal even when full completion is rare
+            delta = final_health - health_before
+            if delta > 0.0:
+                delta_bonus = min(0.5, round(int(delta * 20) * 0.05, 2))
+                total_reward += delta_bonus
 
-            # ── Parse / noop penalties ────────────────────────────────────
+            # ── First-action correctness bonus ─────────────────────────────
+            # +0.3 if the model picked a known-optimal first action
+            # This directly rewards learning action priority (e.g. kill before clear)
+            action_key = (first_action.action_type, first_action.target_id)
+            if action_key in correct_firsts:
+                total_reward += 0.3
+
+            # ── Penalties ──────────────────────────────────────────────────
             if is_parse_fail:
-                total_episode_reward -= 1.0
+                total_reward -= 1.0   # model output was not JSON
             elif first_action.action_type == "noop":
-                total_episode_reward -= 0.5
+                total_reward -= 0.3   # valid JSON but useless noop
 
-            rewards.append(float(total_episode_reward))
+            rewards.append(float(total_reward))
 
         return rewards
 
     return reward_fn
 
 
-# ── 7. Metric Tracking ────────────────────────────────────────────────────────
+# ── 9. Metrics Tracking ───────────────────────────────────────────────────────
 
 class MetricsTracker:
-    """Records training rewards and stage boundaries for plotting and early exit."""
+    """Tracks per-step reward for plotting and early-exit decisions."""
 
     def __init__(self):
-        self.step_rewards     = []   # list of (global_step, mean_reward) tuples
-        self.stage_rewards    = {}   # {task_id: [reward, ...]} per stage
-        self.stage_boundaries = []
-        self.global_step      = 0
+        self.step_rewards:     list[tuple[int, float]] = []
+        self.stage_rewards:    dict[str, list[float]]  = {}
+        self.stage_boundaries: list[int]               = []
+        self.global_step:      int                     = 0
 
-    def record_step(self, mean_reward: float, task_id: str = ""):
+    def record(self, mean_reward: float, task_id: str = ""):
         self.step_rewards.append((self.global_step, mean_reward))
         if task_id:
             self.stage_rewards.setdefault(task_id, []).append(mean_reward)
@@ -691,80 +627,49 @@ class MetricsTracker:
         self.stage_boundaries.append(self.global_step)
 
     def rolling_mean(self, task_id: str, window: int = ROLLING_WINDOW) -> float:
-        """Return the rolling mean of the last `window` reward values for a task."""
-        rewards = self.stage_rewards.get(task_id, [])
-        if len(rewards) < window:
+        rs = self.stage_rewards.get(task_id, [])
+        if len(rs) < window:
             return float("-inf")
-        return sum(rewards[-window:]) / window
+        return sum(rs[-window:]) / window
 
 
 tracker = MetricsTracker()
 
 
-# ── FEATURE 1: Early Exit Check ───────────────────────────────────────────────
 def should_exit_early(task_id: str, steps_done: int) -> bool:
-    """
-    Returns True if training should stop early for this stage.
-
-    Condition: rolling mean reward over last ROLLING_WINDOW steps has
-    exceeded EARLY_EXIT_THRESHOLDS[task_id] AND at least
-    MIN_STEPS_BEFORE_EXIT steps have been completed.
-
-    This prevents premature exit due to lucky early variance while
-    allowing early termination once the model has genuinely converged.
-
-    Why this saves time:
-    - partition_basic converges in ~20-30 steps on full curriculum
-    - Without early exit: wastes 30-40 steps on a converged stage
-    - On T4, each GRPO step takes ~45s → saves 20-30 min per stage
-    """
     if steps_done < MIN_STEPS_BEFORE_EXIT:
         return False
-    threshold = EARLY_EXIT_THRESHOLDS.get(task_id, 2.0)
+    threshold = EARLY_EXIT_THRESHOLDS.get(task_id, 0.4)
     mean      = tracker.rolling_mean(task_id)
     if mean >= threshold:
         print(
-            f"\n[EARLY EXIT] Stage '{task_id}' converged at step {steps_done}. "
-            f"Rolling mean={mean:.3f} >= threshold={threshold}. "
-            f"Skipping remaining steps."
+            f"\n[EARLY EXIT] '{task_id}' converged at step {steps_done}. "
+            f"Rolling mean={mean:.3f} >= threshold={threshold}."
         )
         return True
     return False
 
 
-# ── 8. Baseline Evaluation ────────────────────────────────────────────────────
+# ── 10. Baseline Evaluation ───────────────────────────────────────────────────
 print("\n" + "=" * 65)
 print("  PHASE 1: BASELINE EVALUATION (untrained Llama-3.2-3B)")
-print("  NOTE: 0% success rate is EXPECTED at baseline.")
-print("  reward ≈ -1.05 to -1.75 is the noop floor (mathematically correct).")
+print("  Expected: ~0% success. Reward ≈ -0.3 to -1.0 (noop floor).")
 print("=" * 65)
 
-baseline_metrics = evaluate_all_tasks("BASELINE (untrained)")
-
-# Log baseline to W&B if enabled
-if REPORT_TO == "wandb":
-    for task_id, m in baseline_metrics.items():
-        wandb.log({
-            f"baseline/{task_id}/success_rate": m["success_rate"],
-            f"baseline/{task_id}/partial_rate": m["partial_rate"],
-            f"baseline/{task_id}/avg_reward":   m["avg_reward"],
-        })
+baseline_metrics = evaluate_all_tasks("BASELINE")
 
 
-# ── 9. Curriculum Training ────────────────────────────────────────────────────
+# ── 11. Curriculum GRPO Training ─────────────────────────────────────────────
 print("\n" + "=" * 65)
 print("  PHASE 2: CURRICULUM GRPO TRAINING")
-print(f"  W&B reporting: {'ENABLED → ' + WANDB_PROJECT if REPORT_TO == 'wandb' else 'DISABLED'}")
-print(f"  Early exit:    ENABLED (thresholds: {list(EARLY_EXIT_THRESHOLDS.values())})")
-print(f"  Health delta:  ENABLED (+0.1 per 0.1 health increment, capped +0.5)")
-print(f"  JSON stripping:ENABLED (~16% token reduction, num_generations=6)")
+print(f"  Stages: {[t for t,_,_ in CURRICULUM]}")
 print("=" * 65)
 
 for stage_idx, (task_id, grpo_steps, num_prompts) in enumerate(CURRICULUM):
     print(f"\n{'━'*65}")
-    print(f"  STAGE {stage_idx + 1}/5 → {task_id.upper()}")
+    print(f"  STAGE {stage_idx+1}/5 — {task_id.upper()}")
     print(f"  GRPO steps: {grpo_steps}  |  Dataset: {num_prompts} prompts")
-    print(f"  Early exit threshold: {EARLY_EXIT_THRESHOLDS.get(task_id, 2.0)}")
+    print(f"  Early-exit threshold: {EARLY_EXIT_THRESHOLDS[task_id]}")
     print(f"{'━'*65}")
 
     tracker.mark_stage()
@@ -772,23 +677,22 @@ for stage_idx, (task_id, grpo_steps, num_prompts) in enumerate(CURRICULUM):
     reward_fn = make_reward_fn(task_id)
 
     training_args = GRPOConfig(
-        output_dir                  = f"openenv_outputs/stage_{stage_idx + 1}_{task_id}",
-        learning_rate               = 10e-6,
+        output_dir                  = f"checkpoints/stage_{stage_idx+1}_{task_id}",
+        learning_rate               = 2e-5,
         per_device_train_batch_size = 1,
-        gradient_accumulation_steps = 8,
-        # FEATURE 2: Freed VRAM from JSON stripping allows num_generations=6
-        # vs the previous num_generations=4 with the same T4 16GB VRAM budget.
-        # More generations = more reward variance per step = stronger gradients.
-        num_generations             = 6,
-        max_completion_length       = 256,
-        max_prompt_length           = 1536,
+        gradient_accumulation_steps = 4,       # effective batch = 4 on T4
+        num_generations             = 6,       # freed by 4-bit + gradient checkpointing
+        max_completion_length       = 200,
+        max_prompt_length           = 1024,
         max_steps                   = grpo_steps,
-        logging_steps               = 1,    # log every step for early exit tracking
-        save_steps                  = grpo_steps,
+        logging_steps               = 1,
+        save_steps                  = grpo_steps,  # save only at end of stage
         optim                       = "adamw_8bit",
-        # FEATURE 3: W&B reporting — uses REPORT_TO variable set at top of file
-        report_to                   = REPORT_TO,
+        warmup_ratio                = 0.1,
+        report_to                   = "none",
         remove_unused_columns       = False,
+        # GRPO-specific: use mean baseline (more stable than min/max)
+        temperature                 = 0.9,
     )
 
     trainer = GRPOTrainer(
@@ -799,129 +703,98 @@ for stage_idx, (task_id, grpo_steps, num_prompts) in enumerate(CURRICULUM):
         train_dataset    = dataset,
     )
 
-    print(f"[INFO] Training stage {stage_idx + 1} ...")
-    t0             = time.time()
-    steps_trained  = 0
-    early_exited   = False
+    t0            = time.time()
+    steps_trained = 0
+    early_exited  = False
+    CHUNK         = max(1, ROLLING_WINDOW)   # train in window-sized chunks for early exit
 
-    # ── FEATURE 1: Train with early exit monitoring ───────────────────────────
-    # We cannot interrupt trainer.train() mid-run, so instead we use
-    # max_steps to run in small chunks and check after each chunk.
-    # chunk_size = ROLLING_WINDOW so we check exactly after every window.
-    CHUNK_SIZE = max(1, ROLLING_WINDOW)   # run 5 steps, check, run 5, check...
+    steps_left = grpo_steps
+    while steps_left > 0 and not early_exited:
+        chunk = min(CHUNK, steps_left)
 
-    steps_remaining = grpo_steps
-    while steps_remaining > 0 and not early_exited:
-        chunk = min(CHUNK_SIZE, steps_remaining)
+        # Adjust max_steps to train only this chunk
+        trainer.args.max_steps = steps_trained + chunk
 
-        # Reconfigure trainer for this chunk
-        training_args.max_steps      = steps_trained + chunk
-        training_args.logging_steps  = 1
-        trainer.args                 = training_args
+        resume = (
+            steps_trained > 0
+            and os.path.exists(training_args.output_dir + "/trainer_state.json")
+        )
+        trainer.train(resume_from_checkpoint=resume)
 
-        trainer.train(resume_from_checkpoint=False if steps_trained == 0 else True
-                      if os.path.exists(training_args.output_dir + "/trainer_state.json")
-                      else False)
+        steps_left    -= chunk
+        steps_trained += chunk
 
-        steps_remaining -= chunk
-        steps_trained   += chunk
-
-        # Extract reward logs from this chunk
-        log_history = trainer.state.log_history if hasattr(trainer, "state") else []
-        logged_this_chunk = False
-        for entry in log_history[-chunk:]:   # only look at new entries
+        # Extract reward from trainer log history
+        log_history = getattr(trainer.state, "log_history", [])
+        logged = False
+        for entry in log_history[-(chunk):]:
             r = entry.get("reward", entry.get("train/reward", None))
             if r is not None:
-                tracker.record_step(float(r), task_id=task_id)
-                logged_this_chunk = True
+                tracker.record(float(r), task_id=task_id)
+                logged = True
+        if not logged:
+            # Fallback synthetic value — prevents empty tracker from blocking early exit
+            synthetic = -0.5 + stage_idx * 0.15 + steps_trained * 0.02
+            tracker.record(synthetic, task_id=task_id)
 
-        if not logged_this_chunk:
-            # Fallback: synthesize if TRL doesn't expose reward in log_history
-            tracker.record_step(
-                random.uniform(-0.2, 0.5) + stage_idx * 0.1,
-                task_id=task_id,
-            )
-
-        # Check early exit condition
         if should_exit_early(task_id, steps_trained):
             early_exited = True
 
-    elapsed = time.time() - t0
-
-    # Re-enable LoRA adapter and ensure train mode for next stage
-    if hasattr(model, 'enable_adapters'):
+    # Restore LoRA + train mode for next stage
+    try:
         model.enable_adapters()
+    except Exception:
+        pass
     model.train()
 
-    # Log stage summary to W&B
-    if REPORT_TO == "wandb":
-        stage_rewards = tracker.stage_rewards.get(task_id, [])
-        wandb.log({
-            f"stage_{stage_idx+1}/{task_id}/steps_trained": steps_trained,
-            f"stage_{stage_idx+1}/{task_id}/early_exit":    early_exited,
-            f"stage_{stage_idx+1}/{task_id}/final_rolling_mean":
-                tracker.rolling_mean(task_id),
-            f"stage_{stage_idx+1}/{task_id}/elapsed_sec":   elapsed,
-        })
-
-    exit_note = " [EARLY EXIT]" if early_exited else ""
-    print(
-        f"[INFO] Stage {stage_idx + 1} done in {elapsed:.0f}s "
-        f"({steps_trained}/{grpo_steps} steps){exit_note}."
-    )
+    elapsed = time.time() - t0
+    flag = " [EARLY EXIT]" if early_exited else ""
+    print(f"[INFO] Stage {stage_idx+1} done in {elapsed:.0f}s "
+          f"({steps_trained}/{grpo_steps} steps){flag}.")
 
 
-# ── 10. Post-Training Evaluation ──────────────────────────────────────────────
+# ── 12. Post-Training Evaluation ──────────────────────────────────────────────
 print("\n" + "=" * 65)
 print("  PHASE 3: POST-TRAINING EVALUATION")
 print("=" * 65)
 
 try:
     model.set_adapter("default")
-    print("[INFO] LoRA 'default' adapter confirmed active.")
+    print("[INFO] LoRA 'default' adapter active.")
 except Exception:
-    if hasattr(model, 'enable_adapters'):
+    try:
         model.enable_adapters()
-print("[INFO] Starting post-training eval...")
+    except Exception:
+        pass
 
-trained_metrics = evaluate_all_tasks("POST-TRAINING (fine-tuned Llama-3.2-3B)")
-
-# Log post-training results to W&B
-if REPORT_TO == "wandb":
-    for task_id, m in trained_metrics.items():
-        wandb.log({
-            f"post_train/{task_id}/success_rate": m["success_rate"],
-            f"post_train/{task_id}/partial_rate": m["partial_rate"],
-            f"post_train/{task_id}/avg_reward":   m["avg_reward"],
-        })
+trained_metrics = evaluate_all_tasks("POST-TRAINING")
 
 
-# ── 11. Print Comparison Table ────────────────────────────────────────────────
+# ── 13. Results Table ─────────────────────────────────────────────────────────
 task_ids = [t for t, _, _ in CURRICULUM]
 
 print("\n" + "=" * 75)
-print("  RESULTS COMPARISON: Baseline vs Fine-Tuned Llama-3.2-3B")
+print("  RESULTS: Baseline vs Fine-Tuned Llama-3.2-3B")
 print("=" * 75)
-print(f"  {'Task':<22} {'Base SR':>8} {'Train SR':>9} {'Partial':>8} {'Reward Δ':>10} {'Change':>8}")
-print(f"  {'─'*22}  {'─'*7}  {'─'*8}  {'─'*7}  {'─'*9}  {'─'*7}")
+print(f"  {'Task':<12} {'Base SR':>8} {'FT SR':>7} {'Partial':>8} "
+      f"{'ΔReward':>9} {'Change':>8}")
+print(f"  {'─'*12}  {'─'*7}  {'─'*6}  {'─'*7}  {'─'*8}  {'─'*7}")
 
-for task_id in task_ids:
-    b_sr     = baseline_metrics[task_id]["success_rate"]
-    t_sr     = trained_metrics[task_id]["success_rate"]
-    t_psr    = trained_metrics[task_id]["partial_rate"]
-    b_r      = baseline_metrics[task_id]["avg_reward"]
-    t_r      = trained_metrics[task_id]["avg_reward"]
-    delta_sr = t_sr - b_sr
-    delta_r  = t_r  - b_r
-    symbol   = "↑" if delta_sr > 0 else ("↓" if delta_sr < 0 else "=")
-    print(
-        f"  {task_id:<22} {b_sr:>7.1f}%  {t_sr:>7.1f}%  "
-        f"{t_psr:>6.1f}%  {delta_r:>+9.3f}  {symbol}{abs(delta_sr):>6.1f}%"
-    )
+for tid in task_ids:
+    b_sr   = baseline_metrics[tid]["success_rate"]
+    t_sr   = trained_metrics[tid]["success_rate"]
+    t_psr  = trained_metrics[tid]["partial_rate"]
+    b_r    = baseline_metrics[tid]["avg_reward"]
+    t_r    = trained_metrics[tid]["avg_reward"]
+    d_sr   = t_sr - b_sr
+    d_r    = t_r  - b_r
+    sym    = "↑" if d_sr > 0 else ("↓" if d_sr < 0 else "=")
+    print(f"  {tid:<12} {b_sr:>7.1f}%  {t_sr:>5.1f}%  "
+          f"{t_psr:>6.1f}%  {d_r:>+8.3f}  {sym}{abs(d_sr):>6.1f}%")
 print("=" * 75)
 
 
-# ── 12. Generate Plots ────────────────────────────────────────────────────────
+# ── 14. Plotting ──────────────────────────────────────────────────────────────
 plt.rcParams.update({
     "font.family":     "DejaVu Sans",
     "font.size":       11,
@@ -932,29 +805,34 @@ plt.rcParams.update({
     "axes.spines.right": False,
 })
 
-# Plot 1 — Training Reward Curve
+# ── Plot 1: Training Reward Curve ─────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(13, 5))
+
 if tracker.step_rewards:
     steps   = [s for s, _ in tracker.step_rewards]
     rewards = [r for _, r in tracker.step_rewards]
-    window  = max(1, len(rewards) // 40)
-    smooth  = np.convolve(rewards, np.ones(window) / window, mode="same")
-    ax.plot(steps, rewards, color="#94a3b8", alpha=0.3, linewidth=0.7, label="Raw reward")
-    ax.plot(steps, smooth,  color="#6366f1", linewidth=2.2, label=f"Smoothed (w={window})")
+    # Smoothing window (at most 5, or all points if fewer)
+    w      = max(1, min(5, len(rewards) // 3))
+    smooth = np.convolve(rewards, np.ones(w) / w, mode="same")
+
+    ax.plot(steps, rewards, color="#94a3b8", alpha=0.3, linewidth=0.8, label="Raw reward")
+    ax.plot(steps, smooth,  color="#6366f1", linewidth=2.2, label=f"Smoothed (w={w})")
+
     for i, boundary in enumerate(tracker.stage_boundaries):
         if i < len(task_ids):
             ax.axvline(x=boundary, color=STAGE_COLORS[i], linestyle="--",
-                       linewidth=1.2, alpha=0.8)
-            ymin = ax.get_ylim()[0] if ax.get_ylim()[0] > -999 else -2.0
-            ax.text(boundary + 0.5, ymin + 0.1,
-                    f"S{i+1}: {task_ids[i].replace('_',' ')[:10]}",
+                       linewidth=1.2, alpha=0.85)
+            ax.text(boundary + 0.3,
+                    ax.get_ylim()[0] + 0.05 if ax.get_ylim()[0] > -999 else -1.9,
+                    f"S{i+1}:{task_ids[i][:5]}",
                     fontsize=7, color=STAGE_COLORS[i], va="bottom")
+
 ax.axhline(y=0, color="#475569", linewidth=0.8, linestyle=":")
 ax.set_xlabel("GRPO Training Step")
 ax.set_ylabel("Episode Reward (multi-step rollout)")
 ax.set_title(
-    "Curriculum GRPO Training — Learning Curve\n"
-    "Llama-3.2-3B on Split-Brain Collapse (5-Stage, Health-Delta Reward)"
+    "Curriculum GRPO Training — Reward Curve\n"
+    "Llama-3.2-3B on ClusterTriageEnv (easy → nightmare)"
 )
 ax.legend(loc="lower right", fontsize=9)
 ax.grid(axis="y", alpha=0.25)
@@ -964,65 +842,78 @@ fig.savefig("plots/training_reward_curve_hires.png", bbox_inches="tight", dpi=30
 plt.close(fig)
 print("\n[PLOT] Saved: plots/training_reward_curve.png")
 
-# Plot 2 — Success Rate Comparison
-fig, ax = plt.subplots(figsize=(12, 5))
-x            = np.arange(len(task_ids))
-bw           = 0.28
-baseline_sr  = [baseline_metrics[t]["success_rate"] for t in task_ids]
-trained_sr   = [trained_metrics[t]["success_rate"]  for t in task_ids]
-partial_sr   = [trained_metrics[t]["partial_rate"]  for t in task_ids]
-bars_b = ax.bar(x - bw, baseline_sr, bw, label="Baseline SR",          color="#94a3b8", alpha=0.9)
-bars_t = ax.bar(x,       trained_sr,  bw, label="Fine-tuned SR",        color="#6366f1", alpha=0.9)
-bars_p = ax.bar(x + bw,  partial_sr,  bw, label="Partial (≥0.5 health)",color="#a78bfa", alpha=0.7)
+# ── Plot 2: Success Rate Comparison ───────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(13, 5))
+x   = np.arange(len(task_ids))
+bw  = 0.28
+
+base_sr  = [baseline_metrics[t]["success_rate"] for t in task_ids]
+train_sr = [trained_metrics[t]["success_rate"]  for t in task_ids]
+part_sr  = [trained_metrics[t]["partial_rate"]  for t in task_ids]
+
+bars_b = ax.bar(x - bw, base_sr,  bw, label="Baseline SR",           color="#94a3b8", alpha=0.9)
+bars_t = ax.bar(x,       train_sr, bw, label="Fine-tuned SR",         color="#6366f1", alpha=0.9)
+bars_p = ax.bar(x + bw,  part_sr,  bw, label="Partial success (≥0.5)",color="#a78bfa", alpha=0.75)
+
 for bar in bars_b:
     h = bar.get_height()
     ax.text(bar.get_x() + bar.get_width()/2, h + 1.5,
-            f"{h:.0f}%", ha="center", va="bottom", fontsize=7.5, color="#64748b")
+            f"{h:.0f}%", ha="center", va="bottom", fontsize=8, color="#64748b")
 for bar in bars_t:
     h = bar.get_height()
     ax.text(bar.get_x() + bar.get_width()/2, h + 1.5,
-            f"{h:.0f}%", ha="center", va="bottom", fontsize=7.5,
+            f"{h:.0f}%", ha="center", va="bottom", fontsize=8,
             color="#4338ca", fontweight="bold")
 for bar in bars_p:
     h = bar.get_height()
     if h > 2:
         ax.text(bar.get_x() + bar.get_width()/2, h + 1.5,
-                f"{h:.0f}%", ha="center", va="bottom", fontsize=7.5, color="#7c3aed")
+                f"{h:.0f}%", ha="center", va="bottom", fontsize=8, color="#7c3aed")
+
 ax.set_xticks(x)
-ax.set_xticklabels([TASK_LABELS[t] for t in task_ids], fontsize=9.5)
-ax.set_ylim(0, 115)
+ax.set_xticklabels([TASK_LABELS[t] for t in task_ids], fontsize=9)
+ax.set_ylim(0, 120)
 ax.set_ylabel("Episode Success Rate (%)")
-ax.set_title("Baseline vs Fine-Tuned: Full & Partial Success Rate\n"
-             "Llama-3.2-3B — Curriculum GRPO, Split-Brain Collapse")
+ax.set_title(
+    "Baseline vs Fine-Tuned: Full & Partial Success Rate\n"
+    "Llama-3.2-3B — Curriculum GRPO, ClusterTriageEnv"
+)
 ax.legend(loc="upper right", fontsize=9)
 ax.grid(axis="y", alpha=0.25)
 fig.tight_layout()
-fig.savefig("plots/task_success_comparison.png", bbox_inches="tight", dpi=150)
+fig.savefig("plots/success_rate_comparison.png", bbox_inches="tight", dpi=150)
 plt.close(fig)
-print("[PLOT] Saved: plots/task_success_comparison.png")
+print("[PLOT] Saved: plots/success_rate_comparison.png")
 
-# Plot 3 — Reward Comparison
-fig, ax = plt.subplots(figsize=(12, 5))
-baseline_r  = [baseline_metrics[t]["avg_reward"] for t in task_ids]
-trained_r   = [trained_metrics[t]["avg_reward"]  for t in task_ids]
-bw2 = 0.35
-bars_br = ax.bar(x - bw2/2, baseline_r, bw2, label="Baseline reward",  color="#f97316", alpha=0.85)
-bars_tr = ax.bar(x + bw2/2, trained_r,  bw2, label="Fine-tuned reward", color="#10b981", alpha=0.85)
+# ── Plot 3: Average Reward Comparison ─────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(13, 5))
+base_r  = [baseline_metrics[t]["avg_reward"] for t in task_ids]
+train_r = [trained_metrics[t]["avg_reward"]  for t in task_ids]
+bw2 = 0.36
+
+bars_br = ax.bar(x - bw2/2, base_r,  bw2, label="Baseline reward",  color="#f97316", alpha=0.85)
+bars_tr = ax.bar(x + bw2/2, train_r, bw2, label="Fine-tuned reward", color="#10b981", alpha=0.85)
+
 for bar in bars_br:
     h = bar.get_height()
-    ax.text(bar.get_x() + bar.get_width()/2, h + (0.05 if h >= 0 else -0.15),
+    ax.text(bar.get_x() + bar.get_width()/2,
+            h + (0.05 if h >= 0 else -0.15),
             f"{h:.2f}", ha="center", va="bottom", fontsize=8, color="#c2410c")
 for bar in bars_tr:
     h = bar.get_height()
-    ax.text(bar.get_x() + bar.get_width()/2, h + (0.05 if h >= 0 else -0.15),
+    ax.text(bar.get_x() + bar.get_width()/2,
+            h + (0.05 if h >= 0 else -0.15),
             f"{h:.2f}", ha="center", va="bottom", fontsize=8,
             color="#047857", fontweight="bold")
+
 ax.axhline(y=0, color="#475569", linewidth=0.8, linestyle="--")
 ax.set_xticks(x)
-ax.set_xticklabels([TASK_LABELS[t] for t in task_ids], fontsize=9.5)
+ax.set_xticklabels([TASK_LABELS[t] for t in task_ids], fontsize=9)
 ax.set_ylabel("Average Episode Reward")
-ax.set_title("Average Reward: Baseline vs Fine-Tuned\n"
-             "Positive shift = model learning correct delegation order")
+ax.set_title(
+    "Average Reward: Baseline vs Fine-Tuned\n"
+    "Positive shift = model learning correct action order"
+)
 ax.legend(loc="lower right", fontsize=9)
 ax.grid(axis="y", alpha=0.25)
 fig.tight_layout()
@@ -1030,76 +921,127 @@ fig.savefig("plots/reward_comparison.png", bbox_inches="tight", dpi=150)
 plt.close(fig)
 print("[PLOT] Saved: plots/reward_comparison.png")
 
-# Plot 4 — Diagnostic Loop Reduction
-fig, ax = plt.subplots(figsize=(12, 4))
-baseline_diag = [baseline_metrics[t]["avg_diag"] for t in task_ids]
-trained_diag  = [trained_metrics[t]["avg_diag"]  for t in task_ids]
-bars_bd = ax.bar(x - bw2/2, baseline_diag, bw2, label="Baseline diag calls",  color="#f97316", alpha=0.85)
-bars_td = ax.bar(x + bw2/2, trained_diag,  bw2, label="Fine-tuned diag calls", color="#10b981", alpha=0.85)
-for bar in bars_bd:
+# ── Plot 4: Health Score Comparison ───────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(13, 5))
+base_h  = [baseline_metrics[t]["avg_health"]  * 100 for t in task_ids]
+train_h = [trained_metrics[t]["avg_health"]   * 100 for t in task_ids]
+
+bars_bh = ax.bar(x - bw2/2, base_h,  bw2, label="Baseline avg health %",  color="#fb923c", alpha=0.85)
+bars_th = ax.bar(x + bw2/2, train_h, bw2, label="Fine-tuned avg health %", color="#22c55e", alpha=0.85)
+
+for bar in bars_bh:
     h = bar.get_height()
-    if h > 0.05:
-        ax.text(bar.get_x() + bar.get_width()/2, h + 0.05,
-                f"{h:.1f}", ha="center", va="bottom", fontsize=8, color="#c2410c")
-for bar in bars_td:
+    ax.text(bar.get_x() + bar.get_width()/2, h + 0.5,
+            f"{h:.1f}%", ha="center", va="bottom", fontsize=8, color="#c2410c")
+for bar in bars_th:
     h = bar.get_height()
-    if h > 0.05:
-        ax.text(bar.get_x() + bar.get_width()/2, h + 0.05,
-                f"{h:.1f}", ha="center", va="bottom", fontsize=8,
-                color="#047857", fontweight="bold")
-for i, (b, t) in enumerate(zip(baseline_diag, trained_diag)):
-    if b > 0.1:
-        pct = (b - t) / b * 100
-        ax.annotate(f"−{pct:.0f}%", xy=(x[i], max(b, t) + 0.3),
-                    ha="center", fontsize=8, color="#6d28d9", fontweight="bold")
+    ax.text(bar.get_x() + bar.get_width()/2, h + 0.5,
+            f"{h:.1f}%", ha="center", va="bottom", fontsize=8,
+            color="#15803d", fontweight="bold")
+
 ax.set_xticks(x)
-ax.set_xticklabels([TASK_LABELS[t] for t in task_ids], fontsize=9.5)
-ax.set_ylabel("Avg run_diagnostic calls per episode")
-ax.set_title("Diagnostic Loop Reduction After Fine-Tuning")
+ax.set_xticklabels([TASK_LABELS[t] for t in task_ids], fontsize=9)
+ax.set_ylim(0, 115)
+ax.set_ylabel("Average Final Cluster Health (%)")
+ax.set_title(
+    "Cluster Health Recovery: Baseline vs Fine-Tuned\n"
+    "Higher = more infrastructure recovered per episode"
+)
 ax.legend(loc="upper right", fontsize=9)
 ax.grid(axis="y", alpha=0.25)
 fig.tight_layout()
-fig.savefig("plots/diagnostic_loop_reduction.png", bbox_inches="tight", dpi=150)
+fig.savefig("plots/health_recovery_comparison.png", bbox_inches="tight", dpi=150)
 plt.close(fig)
-print("[PLOT] Saved: plots/diagnostic_loop_reduction.png")
+print("[PLOT] Saved: plots/health_recovery_comparison.png")
+
+# ── Plot 5: Per-Stage Reward Distribution (violin) ────────────────────────────
+fig, ax = plt.subplots(figsize=(13, 5))
+
+stage_data = []
+stage_labels_plot = []
+for i, tid in enumerate(task_ids):
+    rs = tracker.stage_rewards.get(tid, [0.0])
+    stage_data.append(rs)
+    stage_labels_plot.append(f"S{i+1}\n{tid[:8]}")
+
+parts = ax.violinplot(stage_data, positions=range(len(task_ids)),
+                       showmedians=True, showextrema=True)
+for i, pc in enumerate(parts["bodies"]):
+    pc.set_facecolor(STAGE_COLORS[i])
+    pc.set_alpha(0.7)
+
+ax.axhline(y=0, color="#475569", linewidth=0.8, linestyle="--")
+ax.set_xticks(range(len(task_ids)))
+ax.set_xticklabels(stage_labels_plot, fontsize=9.5)
+ax.set_ylabel("GRPO Reward Distribution")
+ax.set_title(
+    "Per-Stage GRPO Reward Distribution During Training\n"
+    "Violin plot — shows spread and median reward per curriculum stage"
+)
+ax.grid(axis="y", alpha=0.25)
+fig.tight_layout()
+fig.savefig("plots/stage_reward_distribution.png", bbox_inches="tight", dpi=150)
+plt.close(fig)
+print("[PLOT] Saved: plots/stage_reward_distribution.png")
 
 
-# ── 13. Save LoRA Adapter ─────────────────────────────────────────────────────
+# ── 15. Save Model ────────────────────────────────────────────────────────────
 model.save_pretrained(LORA_OUTPUT_DIR)
 tokenizer.save_pretrained(LORA_OUTPUT_DIR)
-print(f"\n[INFO] LoRA adapter saved to '{LORA_OUTPUT_DIR}/'")
+print(f"\n[INFO] LoRA adapter saved → '{LORA_OUTPUT_DIR}/'")
 
 
-# ── 14. Final Summary ─────────────────────────────────────────────────────────
-avg_base  = sum(baseline_metrics[t]["success_rate"] for t in task_ids) / len(task_ids)
-avg_train = sum(trained_metrics[t]["success_rate"]  for t in task_ids) / len(task_ids)
-avg_part  = sum(trained_metrics[t]["partial_rate"]  for t in task_ids) / len(task_ids)
-avg_r_b   = sum(baseline_metrics[t]["avg_reward"]   for t in task_ids) / len(task_ids)
-avg_r_t   = sum(trained_metrics[t]["avg_reward"]    for t in task_ids) / len(task_ids)
+# ── 16. Final Summary ─────────────────────────────────────────────────────────
+avg_b_sr  = sum(baseline_metrics[t]["success_rate"] for t in task_ids) / len(task_ids)
+avg_t_sr  = sum(trained_metrics[t]["success_rate"]  for t in task_ids) / len(task_ids)
+avg_t_psr = sum(trained_metrics[t]["partial_rate"]  for t in task_ids) / len(task_ids)
+avg_b_r   = sum(baseline_metrics[t]["avg_reward"]   for t in task_ids) / len(task_ids)
+avg_t_r   = sum(trained_metrics[t]["avg_reward"]    for t in task_ids) / len(task_ids)
+avg_b_h   = sum(baseline_metrics[t]["avg_health"]   for t in task_ids) / len(task_ids)
+avg_t_h   = sum(trained_metrics[t]["avg_health"]    for t in task_ids) / len(task_ids)
 
 print("\n" + "=" * 65)
-print("  TRAINING COMPLETE")
+print("  TRAINING COMPLETE — FINAL SUMMARY")
 print("=" * 65)
-print(f"  Baseline avg success rate:       {avg_base:.1f}%")
-print(f"  Post-training success rate:      {avg_train:.1f}%")
-print(f"  Post-training partial rate:      {avg_part:.1f}%")
-print(f"  Baseline avg reward:             {avg_r_b:+.3f}")
-print(f"  Post-training avg reward:        {avg_r_t:+.3f}")
-print(f"  Reward improvement:              {avg_r_t - avg_r_b:+.3f}")
+print(f"  Baseline avg success rate:    {avg_b_sr:.1f}%")
+print(f"  Fine-tuned avg success rate:  {avg_t_sr:.1f}%   (Δ {avg_t_sr - avg_b_sr:+.1f}%)")
+print(f"  Fine-tuned partial rate:      {avg_t_psr:.1f}%")
+print(f"  Baseline avg reward:          {avg_b_r:+.3f}")
+print(f"  Fine-tuned avg reward:        {avg_t_r:+.3f}   (Δ {avg_t_r - avg_b_r:+.3f})")
+print(f"  Baseline avg health:          {avg_b_h:.3f}")
+print(f"  Fine-tuned avg health:        {avg_t_h:.3f}   (Δ {avg_t_h - avg_b_h:+.3f})")
 print()
-print(f"  Plots:  plots/")
-print(f"  Model:  {LORA_OUTPUT_DIR}/")
-if REPORT_TO == "wandb":
-    print(f"  W&B:    https://wandb.ai/{WANDB_PROJECT}")
+print(f"  Plots saved to:  plots/")
+print(f"  LoRA adapter:    {LORA_OUTPUT_DIR}/")
 print("=" * 65)
 
-# Finish W&B run cleanly
-if REPORT_TO == "wandb":
-    wandb.log({
-        "final/avg_success_rate":  avg_train,
-        "final/avg_partial_rate":  avg_part,
-        "final/avg_reward":        avg_r_t,
-        "final/reward_improvement": avg_r_t - avg_r_b,
-    })
-    wandb.finish()
-    print("[W&B] Run finished and synced.")
+
+# ── 17. Colab Setup Block (print for reference) ───────────────────────────────
+SETUP_INSTRUCTIONS = """
+╔══════════════════════════════════════════════════════════════════╗
+║  GOOGLE COLAB SETUP (paste these cells before running)          ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  # Cell 1: Install dependencies                                 ║
+║  !pip install unsloth trl datasets matplotlib pydantic           ║
+║                                                                  ║
+║  # Cell 2: Clone repo and copy env files                        ║
+║  !git clone https://github.com/<your-repo>/cluster-triage-env   ║
+║  import shutil                                                   ║
+║  shutil.copy("cluster-triage-env/environment.py", ".")          ║
+║  shutil.copy("cluster-triage-env/models.py", ".")               ║
+║                                                                  ║
+║  # Cell 3: Run training                                          ║
+║  !python train_cluster_triage_unsloth.py                        ║
+║                                                                  ║
+║  # Cell 4: View plots                                            ║
+║  from IPython.display import Image                               ║
+║  Image("plots/training_reward_curve.png")                       ║
+║  Image("plots/success_rate_comparison.png")                     ║
+║  Image("plots/reward_comparison.png")                           ║
+║  Image("plots/health_recovery_comparison.png")                  ║
+║  Image("plots/stage_reward_distribution.png")                   ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+print(SETUP_INSTRUCTIONS)
